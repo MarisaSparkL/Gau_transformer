@@ -399,6 +399,7 @@ with torch.no_grad():
         outputs = model(features)
 
         loss = criterion(outputs, labels) 
+        print(outputs.shape)
         
         _, val_pred = torch.max(outputs, 1) 
         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability

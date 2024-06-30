@@ -26,9 +26,11 @@ from torchtext import data
 import math
 import time
 from torch.autograd import Variable
-from rotary_embedding_torch import RotaryEmbedding
+#from rotary_embedding_torch import RotaryEmbedding
 
 import torch.onnx
+
+from my_rotary_embedding import RotaryEmbedding
 
 
 def exists(val):
@@ -109,10 +111,17 @@ class T5RelativePositionBias(nn.Module):
         i, j, device = *x.shape[-2:], x.device
         q_pos = torch.arange(i, dtype = torch.long, device = device)
         k_pos = torch.arange(j, dtype = torch.long, device = device)
-        rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
+        #user-defined
+        k_pos_reshaped = k_pos.view(1, -1)  # 这将 k_pos 转换为形状 [1, j]  
+        q_pos_reshaped = q_pos.view(-1, 1)  # 这将 q_pos 转换为形状 [i, 1]  
+        # 现在计算相对位置差异  
+        rel_pos = k_pos_reshaped - q_pos_reshaped 
+        #rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
         rp_bucket = self._relative_position_bucket(rel_pos, causal = self.causal, num_buckets = self.num_buckets, max_distance = self.max_distance)
         values = self.relative_attention_bias(rp_bucket)
-        bias = rearrange(values, 'i j 1 -> i j')
+        #user-defined
+        bias = values.squeeze(dim=-1)  # 移除最后一个维度（如果它的大小为1）
+        #bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
 class GAU(nn.Module):
@@ -186,11 +195,14 @@ class GAU(nn.Module):
         attn = self.dropout(attn) #attn [500,500]
 
         if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 j')
+            #mask = rearrange(mask, 'b j -> b 1 j')
+            #user-defined
+            mask = mask.view(mask.size(0), 1, mask.size(1))  
             attn = attn.masked_fill(~mask, 0.)
 
         if self.causal:
-            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
+            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.int64, device = device).triu(1)
+            causal_mask = causal_mask.type(torch.bool)
             attn = attn.masked_fill(causal_mask, 0.)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
@@ -381,13 +393,13 @@ for i, batch in enumerate(tqdm(test_data)):
 
 #example_tensor = torch.randn(1,20,500, device='cuda')
 
-onnx_save_path = "./imdb_gau_best.onnx"
+onnx_save_path = "./imdb_gau_best2.onnx"
 
 torch.onnx.export(model,  # model being run
                                 example_tensor,  # model input (or a tuple for multiple inputs)
                                 onnx_save_path,
                                 export_params=True,  # store the trained parameter weights inside the model file 
-                                opset_version=10,    # the ONNX version to export the model to 
+                                opset_version=14,    # the ONNX version to export the model to 
                                 do_constant_folding=True,  # whether to execute constant folding for optimization 
                                 input_names = ['modelInput'],   # the model's input names 
                                 output_names = ['modelOutput']
