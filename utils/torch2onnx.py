@@ -201,7 +201,7 @@ class GAU(nn.Module):
             attn = attn.masked_fill(~mask, 0.)
 
         if self.causal:
-            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.int64, device = device).triu(1)
+            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.int32, device = device).triu(1)
             causal_mask = causal_mask.type(torch.bool)
             attn = attn.masked_fill(causal_mask, 0.)
 
@@ -242,7 +242,7 @@ torch.manual_seed(1234)
 
 class ImdbDataset(Dataset):
     def __init__(
-        self, folder_path="./aclImdb", is_train=True, is_small=False
+        self, folder_path="../aclImdb", is_train=True, is_small=False
     ) -> None:
         super().__init__()
         self.data, self.labels = self.read_dataset(folder_path, is_train, is_small)
@@ -375,7 +375,7 @@ train_data,test_data,vocabs_size = load_data(config)
 config.n_vocab = len(vocabs_size) + 1
 
 model = Model(config)#调用transformer的编码器
-stat_dict = torch.load('../gau_best.pt')
+stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
 model.cuda()
