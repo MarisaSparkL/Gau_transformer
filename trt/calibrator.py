@@ -31,9 +31,6 @@ class Calibrator(trt.IInt8EntropyCalibrator):
         return self.stream.batch_size
 
     def get_batch(self, names):
-        #print("############################################################")
-        #print(names)
-        #print("############################################################")
         batch = self.stream.next_batch()
         if not batch.size:   
             return None
@@ -48,6 +45,8 @@ class Calibrator(trt.IInt8EntropyCalibrator):
             with open(self.cache_file, "rb") as f:
                 logger.info("Using calibration cache to save time: {:}".format(self.cache_file))
                 return f.read()
+        print("No cache file")
+        return None
 
     def write_calibration_cache(self, cache):
         with open(self.cache_file, "wb") as f:

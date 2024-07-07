@@ -48,6 +48,7 @@ class OffsetScale(nn.Module):
         nn.init.normal_(self.gamma, std = 0.02)
 
     def forward(self, x):
+        x = x.to(torch.float32)
         out = einsum('... d, h d -> ... h d', x, self.gamma) + self.beta
         return out.unbind(dim = -2)
     
@@ -61,6 +62,7 @@ class Positional_Encoding(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        x = x.to(torch.float32)
         out = x + nn.Parameter(self.pe, requires_grad=False).to(self.device)
         out = self.dropout(out)
         return out
@@ -108,6 +110,7 @@ class T5RelativePositionBias(nn.Module):
         return ret
 
     def forward(self, x):
+        x = x.to(torch.float32)
         i, j, device = *x.shape[-2:], x.device
         q_pos = torch.arange(i, dtype = torch.long, device = device)
         k_pos = torch.arange(j, dtype = torch.long, device = device)
@@ -172,6 +175,7 @@ class GAU(nn.Module):
         x,
         mask = None
     ):
+        x = x.to(torch.float32)
         seq_len, device = x.shape[-2], x.device
 
         normed_x = self.norm(x)
@@ -201,7 +205,7 @@ class GAU(nn.Module):
             attn = attn.masked_fill(~mask, 0.)
 
         if self.causal:
-            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.int32, device = device).triu(1)
+            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.float32, device = device).triu(1)
             causal_mask = causal_mask.type(torch.bool)
             attn = attn.masked_fill(causal_mask, 0.)
 
@@ -359,8 +363,8 @@ class Model(nn.Module):
         self.fc1 = nn.Linear(config.pad_size * config.dim_model, config.num_classes)
 
     def forward(self, x):
+        x = x.to(torch.int32)
         out = self.embedding(x)
-
         out = self.postion_embedding(out)
         for gau in self.gaus:
             out = gau(out)
@@ -393,7 +397,7 @@ for i, batch in enumerate(tqdm(test_data)):
 
 #example_tensor = torch.randn(1,20,500, device='cuda')
 
-onnx_save_path = "./imdb_gau_best2.onnx"
+onnx_save_path = "../models_save/imdb_gau_best.onnx"
 
 torch.onnx.export(model,  # model being run
                                 example_tensor,  # model input (or a tuple for multiple inputs)

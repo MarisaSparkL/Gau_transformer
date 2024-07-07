@@ -1,20 +1,17 @@
-import torch
-from torch import nn
-import tensorrt as trt
-from torch.utils.data import DataLoader
 import onnx
-import numpy as np
+from onnxruntime.quantization import quantize_static
+from onnxruntime.quantization import CalibrationDataReader
 import torch
+from torch.utils.data import DataLoader
+import numpy as np
 import torch.nn as nn
 import os
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 import collections
 from torchtext.vocab import vocab, GloVe
-import trt_utils
-import glob,os
 
-import argparse
+#加载数据
 
 class Config(object):
     """配置参数"""
@@ -25,7 +22,7 @@ class Config(object):
         self.dropout = 0.5 # 随机失活
         self.num_classes = 2  # 类别数
         self.num_epochs = 200  # epoch数
-        self.batch_size = 5  # mini-batch大小
+        self.batch_size = 20  # mini-batch大小
         self.pad_size = 500   # 每句话处理成的长度(短填长切)
         self.n_vocab = None#这里需要读取数据的部分进行赋值
         self.learning_rate = 5e-4  # 学习率
@@ -125,9 +122,10 @@ def load_data(config):
     """加载数据集"""
     train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
     test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
+
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-       
+
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
 
     train_iter = DataLoader(
@@ -136,55 +134,75 @@ def load_data(config):
     test_iter = DataLoader(test_set, config.batch_size)
     return train_iter, test_iter, vocab
 
-# 准备数据集
+# 假设你已经有了一个 PyTorch DataLoader
+# data_loader = ...
+
+# 获取校准数据
+# calib_data = calib_data_generator(data_loader)
+
+class MyCalibrationDataReader(CalibrationDataReader):
+    def __init__(self, data_loader):
+        """
+        data_loader 是一个生成器或迭代器，返回用于校准的输入数据。
+        """
+        super().__init__()
+        self.data_loader = data_loader
+
+    def get_next(self):
+        """
+        返回下一个校准数据批次。
+        """
+        data = next(self.data_loader, None)
+        if data is None:
+            return None
+        # 假设 data_loader 返回的是一个NumPy数组
+        # 并且模型只有一个输入
+        input_name = self.get_input_name(0)
+        return {input_name: data.astype(np.float32)}
+
 config = Config()
-train_data,test_data,vocabs_size = load_data(config)
-train_loader = test_data
+train_data,test_data,vocabs_size = load_data(config)#加载数据
 
-BATCH_SIZE = 20
-BATCH = 100
-onnx_model_path = '../models_save/imdb_gau_best.onnx'
+calibration_data_reader = MyCalibrationDataReader(test_data)
 
-class MyDataLoader:
-    def __init__(self):
-        self.index = 0
-        self.length = BATCH
-        self.batch_size = BATCH_SIZE
+# 加载 FP32 模型
+model_fp32 = "../models_save/imdb_gau_best.onnx"
+onnx_model = onnx.load(model_fp32)
 
-        self.calibration_data = np.zeros((self.batch_size,config.pad_size,config.embed), dtype=np.int32)
+# 创建量化配置，指定量化模式为静态量化
+quantization_config = {
+    "activation_type": "int32",  # 激活函数量化类型
+    "weight_type": "uint8",      # 权重量化类型
+    "mode": "static",            # 静态量化
+    #'quant_format': "QDQ",       # 量化格式
+    'calibration_method': "entropy"  # 校准方法
+}
 
-    def reset(self):
-        self.index = 0
+# 执行量化
+#quantized_model = quantize_static(model_fp32, quantization_config)
+model_quant_path = "../models_save/imdb_gau_onnx_ptq.onnx"
 
-    def next_batch(self):
-        if self.index < self.length:
-            batch = next(iter(test_data))
-            features, labels = batch
-            self.calibration_data = features
-            self.index += 1
-            # example only
-            return np.ascontiguousarray(self.calibration_data, dtype=np.int32)
-        else:
-            return np.array([])
+# # 指定量化配置，例如使用 Entropy 方法
+# quant_format = 'QDQ'
+# calib_method = 'entropy'
 
-    def __len__(self):
-        return self.length
+# 执行静态量化
+# model_quant = quantize_static(
+#     onnx_model,
+#     model_quant_path,
+#     calibration_data_reader,
+#     quantization_config
+# )
 
-def main():
-    fp16_mode = False
-    int8_mode = True 
-    print('*** onnx to tensorrt begin ***')
-    # calibration
-    calibration_stream = MyDataLoader()
-    engine_model_path = "../models_save/imdb_gau_int8.trt"
-    #calibration_table = "../models_save/imdb_gau_int8.cache"
-    calibration_table = ""
-    # fixed_engine,校准产生校准表
-    engine_fixed = trt_utils.get_engine(BATCH_SIZE, onnx_model_path, engine_model_path, fp16_mode=fp16_mode, 
-        int8_mode=int8_mode, calibration_stream=calibration_stream, calibration_table_path=calibration_table, save_engine=True)
-    assert engine_fixed, 'Broken engine_fixed'
-    print('*** onnx to tensorrt completed ***\n')
-    
-if __name__ == '__main__':
-    main()
-    
+# 保存量化后的模型
+#onnx.save(model_quant, model_quant_path)
+
+quantize_static(
+    model_fp32,
+    model_quant_path,
+    calibration_data_reader,
+    quantization_config
+)
+
+
+

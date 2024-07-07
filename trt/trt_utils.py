@@ -10,10 +10,10 @@ import torch
 import numpy as np
 import time
 
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING) # ** engine可视化 **
+TRT_LOGGER = trt.Logger(trt.Logger.Severity.VERBOSE ) 
+#trt.Logger.WARNING | trt.Logger.INTERNAL_ERROR | trt.Logger.ERROR
 
 # create tensorrt-engine
-  # fixed and dynamic
 def get_engine(max_batch_size=1, onnx_file_path="", engine_file_path="",\
                fp16_mode=False, int8_mode=False, calibration_stream=None, calibration_table_path="", save_engine=False):
     """Attempts to load a serialized engine if available, otherwise builds a new TensorRT engine and saves it."""
@@ -37,9 +37,8 @@ def get_engine(max_batch_size=1, onnx_file_path="", engine_file_path="",\
             
             # build trt engine
             config = builder.create_builder_config()
-            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 32)
-            #builder.max_batch_size = max_batch_size
-            #builder.fp16_mode = fp16_mode
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 34)
+
             if int8_mode:
                 config.set_flag(trt.BuilderFlag.INT8)
                 # builder.int8_mode = int8_mode
