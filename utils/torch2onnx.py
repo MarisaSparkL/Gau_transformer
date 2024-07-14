@@ -200,8 +200,8 @@ class GAU(nn.Module):
 
         if exists(mask):
             #mask = rearrange(mask, 'b j -> b 1 j')
-            #user-defined
-            mask = mask.view(mask.size(0), 1, mask.size(1))  
+            #mask = mask.view(mask.size(0), 1, mask.size(1))  
+            mask = mask.unsqueeze(1)
             attn = attn.masked_fill(~mask, 0.)
 
         if self.causal:

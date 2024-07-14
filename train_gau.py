@@ -355,8 +355,6 @@ class Model(nn.Module):
         out = self.fc1(out)
         return out
 
-
-
 # 预先定义配置
 config = Config()
 train_data,test_data,vocabs_size = load_data(config)#加载数据

@@ -1,17 +1,13 @@
 import onnx
-from onnxruntime.quantization import quantize_static
-from onnxruntime.quantization import CalibrationDataReader
-import torch
-from torch.utils.data import DataLoader
 import numpy as np
+import onnxruntime as rt
+import torch
 import torch.nn as nn
 import os
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 import collections
 from torchtext.vocab import vocab, GloVe
-
-#加载数据
 
 class Config(object):
     """配置参数"""
@@ -122,10 +118,9 @@ def load_data(config):
     """加载数据集"""
     train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
     test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
-
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-
+       
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
 
     train_iter = DataLoader(
@@ -134,94 +129,43 @@ def load_data(config):
     test_iter = DataLoader(test_set, config.batch_size)
     return train_iter, test_iter, vocab
 
-# 假设你已经有了一个 PyTorch DataLoader
-# data_loader = ...
 
-# 获取校准数据
-# calib_data = calib_data_generator(data_loader)
+model_path = '../models_save/ptq_imdb_gau_onnx.onnx'
 
-class MyCalibrationDataReader(CalibrationDataReader):
-    def __init__(self, data_loader):
-        """
-        data_loader 是一个生成器或迭代器，返回用于校准的输入数据。
-        """
-        super().__init__()
-        self.data_loader = data_loader
-
-    def get_next(self):
-        """
-        返回下一个校准数据批次。
-        """
-        batch = next(self.data_loader, None)
-        if batch is None:
-            return None
-        features, labels = batch
-        # example only
-        features = np.ascontiguousarray(features, dtype=np.int64)
-        return {'modelInput': features}
-        return np.ascontiguousarray(features, dtype=np.int32)
-    
-    def get_input_name(self, index):
-        # 假设只有一个输入，直接返回名称
-        return 'modelInput'
-        
-    
-        # data = next(self.data_loader, None)
-        # if data is None:
-        #     return None
-        # # 假设 data_loader 返回的是一个NumPy数组
-        # # 并且模型只有一个输入
-        # input_name = self.get_input_name(0)
-        # return {input_name: data.astype(np.float32)}
+# 验证模型合法性
+onnx_model = onnx.load(model_path)
+onnx.checker.check_model(onnx_model)
 
 config = Config()
-train_iter,test_iter,vocabs_size = load_data(config)#加载数据
-# test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
-# test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-# test_iter = DataLoader(test_set, config.batch_size)
+train_data,test_data,vocabs_size = load_data(config)
 
-calibration_data_reader = MyCalibrationDataReader(iter(test_iter))
+sess = rt.InferenceSession(model_path)
 
-# 加载 FP32 模型
-model_fp32 = "../models_save/imdb_gau_best.onnx"
-onnx_model = onnx.load(model_fp32)
+val_acc = 0.0
+val_loss = 0.0
+for i, batch in enumerate(tqdm(test_data)):
+    features, labels = batch
+    features = features.cuda()
+    
+    labels = labels.cuda()
+    features = features.detach().cpu().numpy()
 
-# 创建量化配置，指定量化模式为静态量化
-quantization_config = {
-    "activation_type": "int32",  # 激活函数量化类型
-    "weight_type": "uint8",      # 权重量化类型
-    "mode": "static",            # 静态量化
-    #'quant_format': "QDQ",       # 量化格式
-    'calibration_method': "entropy"  # 校准方法
-}
+    input_name = sess.get_inputs()[0].name
+    outputs = sess.run(None, {input_name: features})
+    
+    #print(outputs)
 
-# 执行量化
-#quantized_model = quantize_static(model_fp32, quantization_config)
-model_quant_path = "../models_save/ptq_imdb_gau_onnx.onnx"
+    outputs = np.array(outputs)
+    #outputs = torch.Tensor(outputs)
+    outputs = torch.from_numpy(outputs)
+    outputs = torch.squeeze(outputs).cuda()
+    print(outputs.shape)
 
-# # 指定量化配置，例如使用 Entropy 方法
-# quant_format = 'QDQ'
-# calib_method = 'entropy'
+    criterion = nn.CrossEntropyLoss()#多分类的任务
+    loss = criterion(outputs, labels) 
+    
+    _, val_pred = torch.max(outputs, 1) 
+    val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
+    val_loss += loss.item()
 
-# 执行静态量化
-# model_quant = quantize_static(
-#     onnx_model,
-#     model_quant_path,
-#     calibration_data_reader,
-#     quantization_config
-# )
-
-# 保存量化后的模型
-#onnx.save(model_quant, model_quant_path)
-
-model_quant = quantize_static(
-    model_fp32,
-    model_quant_path,
-    calibration_data_reader,
-    quantization_config
-)
-
-onnx.save(model_quant, model_quant_path)
-
-
-
+print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
