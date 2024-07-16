@@ -1,6 +1,5 @@
 import onnx
-from onnxruntime.quantization import quantize_static
-from onnxruntime.quantization import CalibrationDataReader
+from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantFormat, QuantType
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
@@ -186,11 +185,20 @@ calibration_data_reader = MyCalibrationDataReader(iter(test_iter))
 model_fp32 = "../models_save/imdb_gau_best.onnx"
 onnx_model = onnx.load(model_fp32)
 
+quantized_nodes = ['/gaus.0/to_hidden/to_hidden.0/MatMul','/gaus.0/to_qk/to_qk.0/MatMul','/gaus.0/to_out/to_out.0/MatMul',
+'/gaus.1/to_hidden/to_hidden.0/MatMul','/gaus.1/to_qk/to_qk.0/MatMul','/gaus.1/to_out/to_out.0/MatMul',
+'/gaus.2/to_hidden/to_hidden.0/MatMul','/gaus.2/to_qk/to_qk.0/MatMul','/gaus.2/to_out/to_out.0/MatMul',
+'/gaus.3/to_hidden/to_hidden.0/MatMul','/gaus.3/to_qk/to_qk.0/MatMul','/gaus.3/to_out/to_out.0/MatMul'
+]
+
 # 创建量化配置，指定量化模式为静态量化
 quantization_config = {
-    "activation_type": "int32",  # 激活函数量化类型
-    "weight_type": "uint8",      # 权重量化类型
+    "activation_type": "None",  # 激活函数量化类型
+    "weight_type": "int8",      # 权重量化类型
     "mode": "static",            # 静态量化
+    "op_types_to_quantize": ['Gemm','MatMul'],
+    "nodes_to_quantize": quantized_nodes,
+    'quant_format': QuantFormat.QDQ, 
     #'quant_format': "QDQ",       # 量化格式
     'calibration_method': "entropy"  # 校准方法
 }
@@ -214,11 +222,24 @@ model_quant_path = "../models_save/ptq_imdb_gau_onnx.onnx"
 # 保存量化后的模型
 #onnx.save(model_quant, model_quant_path)
 
+# model_quant = quantize_static(
+#     model_fp32,
+#     model_quant_path,
+#     calibration_data_reader,
+#     quantization_config
+# )
+
 model_quant = quantize_static(
     model_fp32,
+    
     model_quant_path,
     calibration_data_reader,
-    quantization_config
+
+    op_types_to_quantize = ['Gemm','MatMul'],
+    nodes_to_quantize = quantized_nodes,
+    weight_type = QuantType.QInt8
+    # activation_type = QuantType.QInt16
+
 )
 
 onnx.save(model_quant, model_quant_path)
