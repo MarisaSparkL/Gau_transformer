@@ -231,7 +231,6 @@ model_quant_path = "../models_save/ptq_imdb_gau_onnx.onnx"
 
 model_quant = quantize_static(
     model_fp32,
-    
     model_quant_path,
     calibration_data_reader,
 

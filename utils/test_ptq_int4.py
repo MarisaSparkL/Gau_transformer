@@ -130,7 +130,7 @@ def load_data(config):
     return train_iter, test_iter, vocab
 
 
-model_path = '../models_save/imdb_gau_best.onnx'
+model_path = '../models_save/ptq_gau_int4_test.onnx'
 
 # 验证模型合法性
 onnx_model = onnx.load(model_path)
