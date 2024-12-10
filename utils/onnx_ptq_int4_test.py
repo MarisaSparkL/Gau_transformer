@@ -51,7 +51,7 @@ for idx in layers:
     prev_data = onnx.numpy_helper.to_array(onnx_model.graph.initializer[idx])
     # print("prev data")
     # print(prev_data)
-    int4_data = prev_data >> 4
+    int4_data = (prev_data >> 4) << 4
     # print("after data")
     # print(int4_data)
     onnx_model.graph.initializer[idx].raw_data = int4_data.tobytes()

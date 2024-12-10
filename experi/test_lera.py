@@ -113,6 +113,22 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
+my_mask = torch.ones(500, 500).triu(1)
+for i in range(500) :
+    for j in range(500) :
+        if abs(i - j) > 100:
+            my_mask[i,j] = 1
+my_mask = my_mask.unsqueeze(0).expand(20, -1, -1)
+#print(my_mask)
+
+my_mask2 = torch.ones(500, 500).tril(1)
+for i in range(500) :
+    for j in range(500) :
+        if abs(i - j) >= 100:
+            my_mask2[i,j] = 1 
+my_mask2 = my_mask2.unsqueeze(0).expand(20, -1, -1)
+#print(my_mask2)
+
 class GAU(nn.Module):
     def __init__(
         self,
@@ -155,6 +171,8 @@ class GAU(nn.Module):
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
+        self.my_mask = my_mask
+        self.my_mask2 = my_mask2
 
     def forward(
         self,
@@ -162,15 +180,91 @@ class GAU(nn.Module):
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-
+        #print("===============================")
+        # print("x")
+        # print(x.shape) 
+        # x [20,500,300]
         normed_x = self.norm(x)
+        # print("normed_x")
+        # print(normed_x.shape)
+        # normed_x [20,500,300]
 
 #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
+        # print("x_shift")
+        # print(x_shift.shape)
+        # x_shift [20,500,150]
+        # print("x_pass")
+        # print(x_pass.shape)
+        # x_pass [20,500,150]
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
+        # print("normed_x")
+        # print(normed_x.shape)
+        # normed_x [20,500,300]
+        
 
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
+
+        gate_mask_list = []
+        for batch in range(20):
+            t_gate = gate[batch]
+            t_gate = t_gate.cpu()
+            t_gate = t_gate.numpy()
+            gate_max = np.max(t_gate)
+            trim_thresh = 1
+            trim_thresh_start = int(np.floor(gate_max))
+            #print("max thresh ",trim_thresh_start)
+            for threshold in range(trim_thresh_start,0,-1):
+                bool_matrix = np.abs(t_gate) >= threshold
+                count = np.sum(bool_matrix)
+                #print("count ",count)
+                if count > (300000 * 0.3):
+                    trim_thresh = threshold
+                    break
+            #print("trim_thresh ",trim_thresh)
+            counts = np.zeros((100, 120))
+            for i in range(100):
+                for j in range(120):
+                    sub_matrix = t_gate[5*i:(5*i + 4), 5*j:(5*j + 4)]
+                    bool_matrix = np.abs(sub_matrix) >= trim_thresh
+                    count = np.sum(bool_matrix)
+                    counts[i][j] = count
+            #np.savetxt('counts.txt', counts, fmt='%d')
+            thresh2 = int(np.max(counts))
+            for t in range(thresh2,0,-1):
+                bool_matrix = np.abs(counts) >= t
+                c = np.sum(bool_matrix)
+                if c > (12000 * 0.3):
+                    thresh2 = t
+                    #print("thresh2 c ",c)
+                    break
+            #print("thresh2 ",thresh2)
+            gate_mask = np.zeros((500, 600))
+            for i in range(100):
+                for j in range(120):
+                    if(counts[i][j] >= thresh2):
+                        gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 1
+                    else:
+                        gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 0.25
+            #gate_mask = np.where(counts == 1, np.ones((5, 5)), np.full((5, 5), 1 >> 2))
+            #np.savetxt('gate_mask.txt', gate_mask, fmt='%f')
+            gate_mask_list.append(gate_mask)
+          
+        gate_mask = np.stack(gate_mask_list, axis=0)
+        gate_mask = gate_mask.astype(np.float32)
+        gate_mask = torch.from_numpy(gate_mask)
+        gate_mask = gate_mask.cuda()
+        # print("gate_mask size",gate_mask.shape)
+        # return
+
+        # t_gate = gate.cpu()
+        # gate1 = t_gate.numpy()
+        # gate1 = gate1[0]
+        # print("gate1 shape")
+        # print(gate1.shape)
+        # np.savetxt('gate1.txt', gate1, fmt='%f')
+        #return
 
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
@@ -183,6 +277,30 @@ class GAU(nn.Module):
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
 
+        my_mask = self.my_mask.type(torch.bool).to(attn.device)
+        # t_mask = self.my_mask.cpu()
+        # mask1 = t_mask.numpy()
+        # np.savetxt('mask1.txt', mask1[0], fmt='%f') 
+        # #print('prev attn')
+        # #print(attn)
+        # print("attn shape")
+        # print(attn.shape)
+        # t_attn = attn.cpu()
+        # array1 = t_attn.numpy()
+        # array1 = array1[0]
+        # print("array shape")
+        # print(array1.shape)
+        # np.savetxt('array1.txt', array1, fmt='%f')
+        attn = attn * self.my_mask2.to(attn.device)
+        #attn = attn.masked_fill(my_mask, 0.)
+        # #print('post attn')
+        # #print(attn)
+        # t_attn = attn.cpu()
+        # array2 = t_attn.numpy()
+        # array2 = array2[0]
+        # np.savetxt('array2.txt', array2, fmt='%f')
+        # return
+
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
             attn = attn.masked_fill(~mask, 0.)
@@ -192,6 +310,9 @@ class GAU(nn.Module):
             attn = attn.masked_fill(causal_mask, 0.)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
+
+        out = gate_mask * out
+
         out = out * gate #out [500,600]
 
         out = self.to_out(out) #out [500,300]
@@ -221,14 +342,14 @@ class Config(object):
         self.hidden = 1024
         self.last_hidden = 512
         self.num_gau = 4
-        self.checkpoint_path = './model.ckpt'
+        self.checkpoint_path = '../model.ckpt'
         self.query_key_dim = 300
 
 torch.manual_seed(1234)
 
 class ImdbDataset(Dataset):
     def __init__(
-        self, folder_path="./aclImdb", is_train=True, is_small=False
+        self, folder_path="../aclImdb", is_train=True, is_small=False
     ) -> None:
         super().__init__()
         self.data, self.labels = self.read_dataset(folder_path, is_train, is_small)
@@ -250,9 +371,6 @@ class ImdbDataset(Dataset):
                     text = f.read().decode("utf-8").replace("\n", "").lower()
                     data.append(text)
                     labels.append(1 if label == "pos" else 0)
-        # random.shuffle(data)
-        # random.shuffle(labels)
-        # 小样本训练，仅用于本机验证
         
         return data, labels
     def __len__(self):
@@ -288,7 +406,6 @@ def get_vocab(data):
         if freq >= 5:
             vocab_freq[word] = len(vocab_freq)
 
-    # 构建词汇表对象并返回
     return vocab(vocab_freq)
 
 
@@ -310,19 +427,14 @@ def preprocess_imdb(train_data, vocab,config):
 
 def load_data(config):
     """加载数据集"""
-    train_data = ImdbDataset(folder_path="./aclImdb", is_train=True)
-    test_data = ImdbDataset(folder_path="./aclImdb", is_train=False)
-    # print("输出第一句话：")
-    # print(train_data.__getitem__(1))
+    train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
+    test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
+
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-    # print("输出第一句话字典编码表示以及序列长度：")
-    # print(train_set.__getitem__(1),train_set.__getitem__(1)[0].shape)
        
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-    # print(f"训练集大小{train_set.__len__()}")
-    # print(f"测试集大小{test_set.__len__()}")
-    # print(f"词表中单词个数:{len(vocab)}")
+
     train_iter = DataLoader(
         train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
     )
@@ -365,7 +477,7 @@ model = Model(config)#调用transformer的编码器
 
 
 #load Model 
-stat_dict = torch.load('gau_best.pt')
+stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
 model.cuda()
@@ -399,12 +511,13 @@ with torch.no_grad():
         outputs = model(features)
 
         loss = criterion(outputs, labels) 
-        print(outputs.shape)
         
         _, val_pred = torch.max(outputs, 1) 
         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
         val_loss += loss.item()
-print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
+        if i >= 125 :
+            break
+print(f'Val Acc: {val_acc/2500:3.5f} loss: {val_loss/len(test_data):3.5f}')
 
 
         
