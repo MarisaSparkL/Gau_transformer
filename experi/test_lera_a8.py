@@ -94,12 +94,10 @@ class T5RelativePositionBias(nn.Module):
 
         max_exact = num_buckets // 2
         is_small = n < max_exact
-
         val_if_large = max_exact + (
             torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
         ).long()
         val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
-
         ret += torch.where(is_small, n, val_if_large)
         return ret
 
@@ -113,21 +111,12 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
-my_mask = torch.ones(500, 500).triu(1)
-for i in range(500) :
-    for j in range(500) :
-        if abs(i - j) > 100:
-            my_mask[i,j] = 1
-my_mask = my_mask.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask)
-
 my_mask2 = torch.ones(500, 500).tril(1)
 for i in range(500) :
     for j in range(500) :
         if abs(i - j) >= 100:
             my_mask2[i,j] = 0 
 my_mask2 = my_mask2.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask2)
 
 class GAU(nn.Module):
     def __init__(
@@ -148,30 +137,23 @@ class GAU(nn.Module):
         self.causal = causal
         self.dropout = nn.Dropout(dropout)
         self.query_key_dim = query_key_dim
-
         self.attn_fn = ReLUSquared() 
-
         self.to_hidden = nn.Sequential(
             nn.Linear(dim, hidden_dim * 2),
             nn.SiLU()
         )
-
         self.to_qk = nn.Sequential(
             nn.Linear(dim, query_key_dim),
             nn.SiLU()
         )
-
         self.offsetscale = OffsetScale(query_key_dim, heads = 2)
-
         self.to_out = nn.Sequential(
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
-        self.my_mask = my_mask
         self.my_mask2 = my_mask2
 
     def forward(
@@ -180,30 +162,12 @@ class GAU(nn.Module):
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-        #print("===============================")
-        # print("x")
-        # print(x.shape) 
-        # x [20,500,300]
         normed_x = self.norm(x)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
-
-#do token shifts
+        #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
-        # print("x_shift")
-        # print(x_shift.shape)
-        # x_shift [20,500,150]
-        # print("x_pass")
-        # print(x_pass.shape)
-        # x_pass [20,500,150]
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
         
-
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
 
         gate_mask_list = []
@@ -255,48 +219,127 @@ class GAU(nn.Module):
         gate_mask = torch.from_numpy(gate_mask)
         gate_mask = gate_mask.cuda()
 
-        # t_gate = gate.cpu()
-        # gate1 = t_gate.numpy()
-        # gate1 = gate1[0]
-        # print("gate1 shape")
-        # print(gate1.shape)
-        # np.savetxt('gate1.txt', gate1, fmt='%f')
-        #return
-
-        qk = self.to_qk(normed_x) #qk [500,128]
-        q, k = self.offsetscale(qk) #q, k [500,128]
-
+        qk = self.to_qk(normed_x) #qk [20,500,128]
+        q, k = self.offsetscale(qk) #q, k [20,500,128]
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
 
+        # #original q,k for comparison
+        # sim_o = einsum('b i d, b j d -> b i j', q, k)
+        # sim_o1 = sim_o.cpu()
+        # sim_o1 = sim_o1.numpy()
+        # sim_o1 = sim_o1[0]
+        # np.savetxt('sim_o1.txt', sim_o1, fmt='%f')
+
+        # sim_o = sim_o + self.rel_pos_bias(sim_o)
+        # attn = self.attn_fn(sim_o / seq_len)
+        # attn = self.dropout(attn) #attn [500,500]
+
+        # if exists(mask):
+        #     mask = rearrange(mask, 'b j -> b 1 j')
+        #     attn = attn.masked_fill(~mask, 0.)
+        # if self.causal:
+        #     causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
+        #     attn = attn.masked_fill(causal_mask, 0.)
+
+        # #original attn,v for comparison
+        # out_o = einsum('b i j, b j d -> b i d', attn, v)
+        # out_o1 = out_o.cpu()
+        # out_o1 = out_o1.numpy()
+        # out_o1 = out_o1[0]
+        # np.savetxt('out_1.txt', out_o1, fmt='%f')
+
+        #start q,k quant
+        q_row_max = torch.max(torch.abs(q), dim=2).values
+        k_row_max = torch.max(torch.abs(k), dim=2).values
+
+        # t_q_row_max = q_row_max.cpu()
+        # q_row_max1 = t_q_row_max.numpy()
+        # q_row_max1 = q_row_max1[0]
+        # np.savetxt('q_row_max1.txt', q_row_max1, fmt='%f')
+        # t_q = q.cpu()
+        # q1 = t_q.numpy()
+        # q1 = q1[0]
+        # np.savetxt('q1.txt', q1, fmt='%f')
+        # t_k_row_max = k_row_max.cpu()
+        # k_row_max1 = t_k_row_max.numpy()
+        # k_row_max1 = k_row_max1[0]
+        # np.savetxt('k_row_max1.txt', k_row_max1, fmt='%f')
+        # t_k = k.cpu()
+        # k1 = t_k.numpy()
+        # k1 = k1[0]
+        # np.savetxt('k1.txt', k1, fmt='%f')
+        
+
+        # print("q_max shape",q_row_max.shape)
+        # print(q_row_max)
+        # print("k_max_shape",k_row_max.shape)
+        # print(k_row_max)
+
+        q_row_scale = q_row_max / 127
+        k_row_scale = k_row_max / 127
+
+        for batch in range(20):
+            for i in range(500):
+                q[batch,i,:] = q[batch,i,:] / q_row_scale[batch,i]
+                k[batch,i,:] = k[batch,i,:] / k_row_scale[batch,i]
+
+        # t_q2 = q.cpu()
+        # q2 = t_q2.numpy()
+        # q2 = q2[0]
+        # np.savetxt('q2.txt', q2, fmt='%f')
+
+        q = torch.clamp(q, min=-127, max=127)
+        k = torch.clamp(k, min=-127, max=127)
+        q = q.to(torch.int8)
+        k = k.to(torch.int8)
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
+
+        # t_q = q.cpu()
+        # t_q = t_q.numpy()
+        # t_q = t_q[0]
+        # np.savetxt('q3.txt', t_q, fmt='%f')
+
+        # t_k = k.cpu()
+        # t_k = t_k.numpy()
+        # t_k = t_k[0]
+        # np.savetxt('k3.txt', t_k, fmt='%f')
+
+        # t_q = q.cpu()
+        # q1 = t_q.numpy()
+        # q1 = q1[0]
+        # np.savetxt('q1.txt', q1, fmt='%f')
+        # t_k = k.cpu()
+        # k1 = t_k.numpy()
+        # k1 = k1[0]
+        # np.savetxt('k1.txt', k1, fmt='%f')
+
         sim = einsum('b i d, b j d -> b i j', q, k)
+        sim = sim.to(torch.int32)
+        sim = sim.to(torch.float32)
+
+        # sim_1 = sim.cpu()
+        # sim_1 = sim_1.numpy()
+        # sim_1 = sim_1[0]
+        # np.savetxt('sim_1.txt', sim_1, fmt='%f') 
+
+        #sim反量化
+        for batch in range(20):
+            sim_quant_matrix = torch.outer(q_row_scale[batch], k_row_scale[batch])
+            sim[batch] = sim[batch] * sim_quant_matrix
+
+        # sim_1 = sim.cpu()
+        # sim_1 = sim_1.numpy()
+        # sim_1 = sim_1[0]
+        # np.savetxt('sim_2.txt', sim_1, fmt='%f')  
+        # return 
+
         sim = sim + self.rel_pos_bias(sim)
 
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
 
-        my_mask = self.my_mask.type(torch.bool).to(attn.device)
-        # t_mask = self.my_mask.cpu()
-        # mask1 = t_mask.numpy()
-        # np.savetxt('mask1.txt', mask1[0], fmt='%f') 
-        # #print('prev attn')
-        # #print(attn)
-        # print("attn shape")
-        # print(attn.shape)
-        # t_attn = attn.cpu()
-        # array1 = t_attn.numpy()
-        # array1 = array1[0]
-        # print("array shape")
-        # print(array1.shape)
-        # np.savetxt('array1.txt', array1, fmt='%f')
         attn = attn * self.my_mask2.to(attn.device)
-        #attn = attn.masked_fill(my_mask, 0.)
-        # #print('post attn')
-        # #print(attn)
-        # t_attn = attn.cpu()
-        # array2 = t_attn.numpy()
-        # array2 = array2[0]
-        # np.savetxt('array2.txt', array2, fmt='%f')
-        # return
 
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
@@ -306,12 +349,51 @@ class GAU(nn.Module):
             causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
 
+        # original attn,v for comparison
+        # out_o = einsum('b i j, b j d -> b i d', attn, v)
+        # out_o1 = out_o.cpu()
+        # out_o1 = out_o1.numpy()
+        # out_o1 = out_o1[0]
+        # np.savetxt('out_o1.txt', out_o1, fmt='%f')
+
+        #attn,out quantize
+        attn_row_max = torch.max(torch.abs(attn), dim=2).values
+        v_col_max = torch.max(torch.abs(v), dim=1).values
+        #print("v_col_max",v_col_max.shape)
+
+        attn_row_scale = attn_row_max / 127
+        v_col_scale = v_col_max / 127
+
+        for batch in range(20):
+            for i in range(500):
+                attn[batch,i,:] = attn[batch,i,:] / attn_row_scale[batch,i]
+            for i in range(600):
+                v[batch,:,i] = v[batch,:,i] / v_col_scale[batch,i]
+
+        attn = torch.clamp(attn, min=-127, max=127)
+        v = torch.clamp(v, min=-127, max=127)
+        attn = attn.to(torch.int8)
+        v = v.to(torch.int8)
+        attn = attn.to(torch.float32)
+        v = v.to(torch.float32)
+
         out = einsum('b i j, b j d -> b i d', attn, v)
+        out = out.to(torch.int32)
+        out = out.to(torch.float32)
 
         out = gate_mask * out
 
-        out = out * gate #out [500,600]
+        #out反量化
+        for batch in range(20):
+            out_quant_matrix = torch.outer(attn_row_scale[batch], v_col_scale[batch])
+            out[batch] = out[batch] * out_quant_matrix
 
+        # out_1 = out.cpu()
+        # out_1 = out_1.numpy()
+        # out_1 = out_1[0]
+        # np.savetxt('out_2.txt', out_1, fmt='%f')  
+        
+        out = out * gate #out [500,600]
         out = self.to_out(out) #out [500,300]
 
         if self.add_residual:
@@ -464,8 +546,6 @@ class Model(nn.Module):
         out = self.fc1(out)
         return out
 
-
-
 # 预先定义配置
 config = Config()
 train_data,test_data,vocabs_size = load_data(config)#加载数据
@@ -482,18 +562,6 @@ model.cuda()
 optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
 criterion = nn.CrossEntropyLoss()#多分类的任务
 batch_size=config.batch_size
-
-#记录模型参数量
-# params = list(model.parameters())
-# k = 0
-# for i in params:
-#     l = 1
-#     print("该层的结构：" + str(list(i.size())))
-#     for j in i.size():
-#         l *= j
-#     print("该层参数和：" + str(l))
-#     k = k + l
-# print("总参数数量和：" + str(k))
 
 val_acc = 0.0
 val_loss = 0.0
@@ -512,8 +580,6 @@ with torch.no_grad():
         _, val_pred = torch.max(outputs, 1) 
         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
         val_loss += loss.item()
-        # if i >= 125:
-        #     break
 
 print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
 

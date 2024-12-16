@@ -26,7 +26,11 @@ from torchtext import data
 import math
 import time
 from torch.autograd import Variable
-from rotary_embedding_torch import RotaryEmbedding
+#from rotary_embedding_torch import RotaryEmbedding
+
+import torch.onnx
+
+from my_rotary_embedding import RotaryEmbedding
 
 
 def exists(val):
@@ -44,6 +48,7 @@ class OffsetScale(nn.Module):
         nn.init.normal_(self.gamma, std = 0.02)
 
     def forward(self, x):
+        x = x.to(torch.float32)
         out = einsum('... d, h d -> ... h d', x, self.gamma) + self.beta
         return out.unbind(dim = -2)
     
@@ -57,6 +62,7 @@ class Positional_Encoding(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        x = x.to(torch.float32)
         out = x + nn.Parameter(self.pe, requires_grad=False).to(self.device)
         out = self.dropout(out)
         return out
@@ -104,22 +110,29 @@ class T5RelativePositionBias(nn.Module):
         return ret
 
     def forward(self, x):
+        x = x.to(torch.float32)
         i, j, device = *x.shape[-2:], x.device
         q_pos = torch.arange(i, dtype = torch.long, device = device)
         k_pos = torch.arange(j, dtype = torch.long, device = device)
-        rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
+        #user-defined
+        k_pos_reshaped = k_pos.view(1, -1)  # 这将 k_pos 转换为形状 [1, j]  
+        q_pos_reshaped = q_pos.view(-1, 1)  # 这将 q_pos 转换为形状 [i, 1]  
+        # 现在计算相对位置差异  
+        rel_pos = k_pos_reshaped - q_pos_reshaped 
+        #rel_pos = rearrange(k_pos, 'j -> 1 j') - rearrange(q_pos, 'i -> i 1')
         rp_bucket = self._relative_position_bucket(rel_pos, causal = self.causal, num_buckets = self.num_buckets, max_distance = self.max_distance)
         values = self.relative_attention_bias(rp_bucket)
-        bias = rearrange(values, 'i j 1 -> i j')
+        #user-defined
+        bias = values.squeeze(dim=-1)  # 移除最后一个维度（如果它的大小为1）
+        #bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
-my_mask = torch.ones(500, 500).triu(1)
-for i in range(500) :
-    for j in range(500) :
-        if abs(i - j) > 100:
-            my_mask[i,j] = 1
-my_mask = my_mask.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask)
+# my_mask = torch.ones(500, 500).triu(1)
+# for i in range(500) :
+#     for j in range(500) :
+#         if abs(i - j) > 100:
+#             my_mask[i,j] = 1
+# my_mask = my_mask.unsqueeze(0).expand(20, -1, -1)
 
 my_mask2 = torch.ones(500, 500).tril(1)
 for i in range(500) :
@@ -127,7 +140,6 @@ for i in range(500) :
         if abs(i - j) >= 100:
             my_mask2[i,j] = 0 
 my_mask2 = my_mask2.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask2)
 
 class GAU(nn.Module):
     def __init__(
@@ -171,7 +183,7 @@ class GAU(nn.Module):
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
-        self.my_mask = my_mask
+        # self.my_mask = my_mask
         self.my_mask2 = my_mask2
 
     def forward(
@@ -180,88 +192,65 @@ class GAU(nn.Module):
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-        #print("===============================")
-        # print("x")
-        # print(x.shape) 
-        # x [20,500,300]
         normed_x = self.norm(x)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
 
-#do token shifts
+        #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
-        # print("x_shift")
-        # print(x_shift.shape)
-        # x_shift [20,500,150]
-        # print("x_pass")
-        # print(x_pass.shape)
-        # x_pass [20,500,150]
+
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
         
 
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
 
-        gate_mask_list = []
-        for batch in range(20):
-            t_gate = gate[batch]
-            t_gate = t_gate.cpu()
-            t_gate = t_gate.numpy()
-            gate_max = np.max(t_gate)
-            trim_thresh = 1
-            trim_thresh_start = int(np.floor(gate_max))
-            #print("max thresh ",trim_thresh_start)
-            for threshold in range(trim_thresh_start,0,-1):
-                bool_matrix = np.abs(t_gate) >= threshold
-                count = np.sum(bool_matrix)
-                #print("count ",count)
-                if count > (300000 * 0.3):
-                    trim_thresh = threshold
-                    break
-            #print("trim_thresh ",trim_thresh)
-            counts = np.zeros((100, 120))
-            for i in range(100):
-                for j in range(120):
-                    sub_matrix = t_gate[5*i:(5*i + 4), 5*j:(5*j + 4)]
-                    bool_matrix = np.abs(sub_matrix) >= trim_thresh
-                    count = np.sum(bool_matrix)
-                    counts[i][j] = count
-            #np.savetxt('counts.txt', counts, fmt='%d')
-            thresh2 = int(np.max(counts))
-            for t in range(thresh2,0,-1):
-                bool_matrix = np.abs(counts) >= t
-                c = np.sum(bool_matrix)
-                if c > (12000 * 0.3):
-                    thresh2 = t
-                    #print("thresh2 c ",c)
-                    break
-            #print("thresh2 ",thresh2)
-            gate_mask = np.zeros((500, 600))
-            for i in range(100):
-                for j in range(120):
-                    if(counts[i][j] >= thresh2):
-                        gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 1
-                    else:
-                        gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 0.25
-            #gate_mask = np.where(counts == 1, np.ones((5, 5)), np.full((5, 5), 1 >> 2))
-            #np.savetxt('gate_mask.txt', gate_mask, fmt='%f')
-            gate_mask_list.append(gate_mask)
-        gate_mask = np.stack(gate_mask_list, axis=0)
-        gate_mask = gate_mask.astype(np.float32)
-        gate_mask = torch.from_numpy(gate_mask)
-        gate_mask = gate_mask.cuda()
-
-        # t_gate = gate.cpu()
-        # gate1 = t_gate.numpy()
-        # gate1 = gate1[0]
-        # print("gate1 shape")
-        # print(gate1.shape)
-        # np.savetxt('gate1.txt', gate1, fmt='%f')
-        #return
+        # gate_mask_list = []
+        # for batch in range(20):
+        #     t_gate = gate[batch]
+        #     t_gate = t_gate.cpu()
+        #     t_gate = t_gate.numpy()
+        #     gate_max = np.max(t_gate)
+        #     trim_thresh = 1
+        #     trim_thresh_start = int(np.floor(gate_max))
+        #     #print("max thresh ",trim_thresh_start)
+        #     for threshold in range(trim_thresh_start,0,-1):
+        #         bool_matrix = np.abs(t_gate) >= threshold
+        #         count = np.sum(bool_matrix)
+        #         #print("count ",count)
+        #         if count > (300000 * 0.3):
+        #             trim_thresh = threshold
+        #             break
+        #     #print("trim_thresh ",trim_thresh)
+        #     counts = np.zeros((100, 120))
+        #     for i in range(100):
+        #         for j in range(120):
+        #             sub_matrix = t_gate[5*i:(5*i + 4), 5*j:(5*j + 4)]
+        #             bool_matrix = np.abs(sub_matrix) >= trim_thresh
+        #             count = np.sum(bool_matrix)
+        #             counts[i][j] = count
+        #     #np.savetxt('counts.txt', counts, fmt='%d')
+        #     thresh2 = int(np.max(counts))
+        #     for t in range(thresh2,0,-1):
+        #         bool_matrix = np.abs(counts) >= t
+        #         c = np.sum(bool_matrix)
+        #         if c > (12000 * 0.3):
+        #             thresh2 = t
+        #             #print("thresh2 c ",c)
+        #             break
+        #     #print("thresh2 ",thresh2)
+        #     gate_mask = np.zeros((500, 600))
+        #     for i in range(100):
+        #         for j in range(120):
+        #             if(counts[i][j] >= thresh2):
+        #                 gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 1
+        #             else:
+        #                 gate_mask[i*5:i*5+4,5*j:(5*j + 4)] = 0.25
+        #     #gate_mask = np.where(counts == 1, np.ones((5, 5)), np.full((5, 5), 1 >> 2))
+        #     #np.savetxt('gate_mask.txt', gate_mask, fmt='%f')
+        #     gate_mask_list.append(gate_mask)
+        # gate_mask = np.stack(gate_mask_list, axis=0)
+        # gate_mask = gate_mask.astype(np.float32)
+        # gate_mask = torch.from_numpy(gate_mask)
+        # gate_mask = gate_mask.cuda()
 
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
@@ -274,29 +263,9 @@ class GAU(nn.Module):
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
 
-        my_mask = self.my_mask.type(torch.bool).to(attn.device)
-        # t_mask = self.my_mask.cpu()
-        # mask1 = t_mask.numpy()
-        # np.savetxt('mask1.txt', mask1[0], fmt='%f') 
-        # #print('prev attn')
-        # #print(attn)
-        # print("attn shape")
-        # print(attn.shape)
-        # t_attn = attn.cpu()
-        # array1 = t_attn.numpy()
-        # array1 = array1[0]
-        # print("array shape")
-        # print(array1.shape)
-        # np.savetxt('array1.txt', array1, fmt='%f')
+        # my_mask = self.my_mask.type(torch.bool).to(attn.device)
+
         attn = attn * self.my_mask2.to(attn.device)
-        #attn = attn.masked_fill(my_mask, 0.)
-        # #print('post attn')
-        # #print(attn)
-        # t_attn = attn.cpu()
-        # array2 = t_attn.numpy()
-        # array2 = array2[0]
-        # np.savetxt('array2.txt', array2, fmt='%f')
-        # return
 
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
@@ -308,7 +277,7 @@ class GAU(nn.Module):
 
         out = einsum('b i j, b j d -> b i d', attn, v)
 
-        out = gate_mask * out
+        # out = gate_mask * out
 
         out = out * gate #out [500,600]
 
@@ -318,7 +287,6 @@ class GAU(nn.Module):
             out = out + x
 
         return out
-
 
 
 class Config(object):
@@ -339,7 +307,7 @@ class Config(object):
         self.hidden = 1024
         self.last_hidden = 512
         self.num_gau = 4
-        self.checkpoint_path = '../model.ckpt'
+        self.checkpoint_path = './model.ckpt'
         self.query_key_dim = 300
 
 torch.manual_seed(1234)
@@ -368,6 +336,9 @@ class ImdbDataset(Dataset):
                     text = f.read().decode("utf-8").replace("\n", "").lower()
                     data.append(text)
                     labels.append(1 if label == "pos" else 0)
+        # random.shuffle(data)
+        # random.shuffle(labels)
+        # 小样本训练，仅用于本机验证
         
         return data, labels
     def __len__(self):
@@ -403,6 +374,7 @@ def get_vocab(data):
         if freq >= 5:
             vocab_freq[word] = len(vocab_freq)
 
+    # 构建词汇表对象并返回
     return vocab(vocab_freq)
 
 
@@ -426,12 +398,17 @@ def load_data(config):
     """加载数据集"""
     train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
     test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
-
+    # print("输出第一句话：")
+    # print(train_data.__getitem__(1))
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
+    # print("输出第一句话字典编码表示以及序列长度：")
+    # print(train_set.__getitem__(1),train_set.__getitem__(1)[0].shape)
        
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-
+    # print(f"训练集大小{train_set.__len__()}")
+    # print(f"测试集大小{test_set.__len__()}")
+    # print(f"词表中单词个数:{len(vocab)}")
     train_iter = DataLoader(
         train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
     )
@@ -454,8 +431,8 @@ class Model(nn.Module):
         self.fc1 = nn.Linear(config.pad_size * config.dim_model, config.num_classes)
 
     def forward(self, x):
+        x = x.to(torch.int32)
         out = self.embedding(x)
-
         out = self.postion_embedding(out)
         for gau in self.gaus:
             out = gau(out)
@@ -464,58 +441,42 @@ class Model(nn.Module):
         out = self.fc1(out)
         return out
 
-
-
 # 预先定义配置
 config = Config()
-train_data,test_data,vocabs_size = load_data(config)#加载数据
-config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
+train_data,test_data,vocabs_size = load_data(config)
+config.n_vocab = len(vocabs_size) + 1
+
 model = Model(config)#调用transformer的编码器
-
-
-#load Model 
 stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
 model.cuda()
+model.eval()
 
-optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
-criterion = nn.CrossEntropyLoss()#多分类的任务
-batch_size=config.batch_size
-
-#记录模型参数量
-# params = list(model.parameters())
-# k = 0
-# for i in params:
-#     l = 1
-#     print("该层的结构：" + str(list(i.size())))
-#     for j in i.size():
-#         l *= j
-#     print("该层参数和：" + str(l))
-#     k = k + l
-# print("总参数数量和：" + str(k))
-
-val_acc = 0.0
-val_loss = 0.0
-
-model.eval() # set the model to evaluation mode
-with torch.no_grad():
-    for i, batch in enumerate(tqdm(test_data)):
+for i, batch in enumerate(tqdm(test_data)):
         features, labels = batch
         features = features.cuda()
-        
-        labels = labels.cuda()
-        outputs = model(features)
+        example_tensor = features
 
-        loss = criterion(outputs, labels) 
-        
-        _, val_pred = torch.max(outputs, 1) 
-        val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
-        val_loss += loss.item()
-        # if i >= 125:
-        #     break
+#example_tensor = torch.randn(1,1,20,500, device='cuda')
+# example_tensor = torch.randn(1,20,500)
+#example_tensor = example_tensor.long()
+# example_tensor = example_tensor.cuda()
 
-print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
+#example_tensor = torch.randn(1,20,500, device='cuda')
 
+onnx_save_path = "../models_save/imdb_gau_best_lera.onnx"
 
-        
+torch.onnx.export(model,  # model being run
+                                example_tensor,  # model input (or a tuple for multiple inputs)
+                                onnx_save_path,
+                                export_params=True,  # store the trained parameter weights inside the model file 
+                                opset_version=14,    # the ONNX version to export the model to 
+                                do_constant_folding=True,  # whether to execute constant folding for optimization 
+                                input_names = ['modelInput'],   # the model's input names 
+                                output_names = ['modelOutput']
+                                )
+
+# onnx_program = torch.onnx.dynamo_export(model, example_tensor)
+# onnx_program.save("gau_best.onnx")
+ 

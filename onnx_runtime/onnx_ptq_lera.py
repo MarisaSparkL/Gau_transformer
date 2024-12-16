@@ -1,5 +1,3 @@
-#跑不起来
-
 import onnx
 from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantFormat, QuantType
 import torch
@@ -184,7 +182,7 @@ train_iter,test_iter,vocabs_size = load_data(config)#加载数据
 calibration_data_reader = MyCalibrationDataReader(iter(test_iter))
 
 # 加载 FP32 模型
-model_fp32 = "../models_save/imdb_gau_best.onnx"
+model_fp32 = "../models_save/imdb_gau_best_lera.onnx"
 onnx_model = onnx.load(model_fp32)
 
 quantized_nodes = ['/gaus.0/to_hidden/to_hidden.0/MatMul','/gaus.0/to_qk/to_qk.0/MatMul','/gaus.0/to_out/to_out.0/MatMul',
@@ -195,7 +193,7 @@ quantized_nodes = ['/gaus.0/to_hidden/to_hidden.0/MatMul','/gaus.0/to_qk/to_qk.0
 
 # 创建量化配置，指定量化模式为静态量化
 quantization_config = {
-    "activation_type": "int8",  # 激活函数量化类型
+    "activation_type": "None",  # 激活函数量化类型
     "weight_type": "int8",      # 权重量化类型
     "mode": "static",            # 静态量化
     "op_types_to_quantize": ['Gemm','MatMul'],
@@ -207,7 +205,7 @@ quantization_config = {
 
 # 执行量化
 #quantized_model = quantize_static(model_fp32, quantization_config)
-model_quant_path = "../models_save/ptq_w8a8_imdb_gau.onnx"
+model_quant_path = "../models_save/ptq_imdb_gau_lera.onnx"
 
 # # 指定量化配置，例如使用 Entropy 方法
 # quant_format = 'QDQ'
@@ -235,16 +233,15 @@ model_quant = quantize_static(
     model_fp32,
     model_quant_path,
     calibration_data_reader,
+
     op_types_to_quantize = ['Gemm','MatMul'],
     nodes_to_quantize = quantized_nodes,
-    weight_type = QuantType.QInt8,
-    activation_type = QuantType.QInt8
+    weight_type = QuantType.QInt8
+    # activation_type = QuantType.QInt16
+
 )
 
-if model_quant is None:
-    raise ValueError("模型加载失败,返回值为None")
-else:
-    onnx.save(model_quant, model_quant_path)
+onnx.save(model_quant, model_quant_path)
 
 
 
