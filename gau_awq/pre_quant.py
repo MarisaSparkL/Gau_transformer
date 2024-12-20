@@ -6,11 +6,6 @@ import functools
 from collections import defaultdict
 from typing import List
 
-from transformers.models.bloom.modeling_bloom import BloomForCausalLM
-from transformers.models.opt.modeling_opt import OPTForCausalLM
-from transformers.models.llama.modeling_llama import LlamaForCausalLM
-from tinychat.models import LlavaLlamaForCausalLM
-
 from .auto_scale import auto_scale_block, apply_scale
 from .auto_clip import auto_clip_block, apply_clip
 
@@ -20,99 +15,39 @@ __all__ = ["run_awq"]
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
 
-
 def get_blocks(model):
-    if model.__class__.__name__ == "LlamaForCausalLM":
-        layers = model.model.layers
-    elif model.__class__.__name__ == "LlavaLlamaForCausalLM":
-        # layers = [model.model.layers, model.model.vision_tower.vision_tower.vision_model.encoder.layers]
-        layers = model.model.layers
-    elif isinstance(model, OPTForCausalLM):
-        layers = model.model.decoder.layers
-    elif isinstance(model, BloomForCausalLM):
-        layers = model.transformer.h
-    elif "mpt" in str(model.__class__).lower():
-        layers = model.transformer.blocks
-    elif "falcon" in str(model.__class__).lower():
-        layers = model.transformer.h
-    elif "bigcode" in str(model.__class__).lower():
-        layers = model.transformer.h
-    elif "neox" in str(model.__class__).lower():
-        layers = model.gpt_neox.layers
-    else:
-        raise NotImplementedError(type(model))
+    layers = model.gaus
     return layers
-
-
-def move_embed(model, device):
-    if isinstance(model, LlamaForCausalLM):
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
-    elif isinstance(model, LlavaLlamaForCausalLM):
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
-        model.model.vision_tower.vision_tower.vision_model.embeddings.to(device)
-    elif isinstance(model, OPTForCausalLM):
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(device)
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(
-            device
-        )
-    elif isinstance(model, BloomForCausalLM):
-        model.transformer.word_embeddings = model.transformer.word_embeddings.to(device)
-        model.transformer.word_embeddings_layernorm = (
-            model.transformer.word_embeddings_layernorm.to(device)
-        )
-    elif "mpt" in str(model.__class__).lower():
-        model.transformer.wte = model.transformer.wte.to(device)
-        model.transformer.emb_drop = model.transformer.emb_drop.to(device)
-    elif "falcon" in str(model.__class__).lower():
-        model.transformer.word_embeddings = model.transformer.word_embeddings.to(device)
-    elif "bigcode" in str(model.__class__).lower():
-        model.transformer.wte = model.transformer.wte.to(device)
-        model.transformer.wpe = model.transformer.wpe.to(device)
-        model.transformer.drop = model.transformer.drop.to(device)
-    elif "neox" in str(model.__class__).lower():
-        model.gpt_neox.embed_in = model.gpt_neox.embed_in.to(device)
-        model.gpt_neox.emb_dropout = model.gpt_neox.emb_dropout.to(device)
-        model.embed_out = model.embed_out.to(device)
-    else:
-        raise NotImplementedError(type(model))
-
 
 @torch.no_grad()
 def run_awq(
     model,
-    enc,
     w_bit,
     q_config,
-    n_samples=512,
-    seqlen=512,
+    n_samples=32,
+    seqlen=32,
     auto_scale=True,
     mse_range=True,
-    # some configs for ablation study
-    calib_data="pileval",
 ):
-    from ..utils.calib_data import get_calib_dataset
-    from ..utils.module import append_str_prefix, get_op_name
-
-    if "bigcode" in str(model.__class__).lower():
-        # otherwise attention_mask will always be on cpu.
-        model.transformer.bias = model.transformer.bias.to("cuda")
+    from .awq_utils import get_calib_dataset
+    from .awq_utils import get_op_name
+    from .awq_utils import append_str_prefix
 
     layers = get_blocks(model)
 
     samples = get_calib_dataset(
-        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen
+        n_samples=n_samples, block_size=seqlen
     )
-    samples = torch.cat(samples, dim=0)
+
+    
+    samples = samples[0].cuda()
+    # samples = torch.cat(samples, dim=0)
 
     inps = []
-    layer_kwargs = {}
 
     layers[0] = layers[0].cuda()
-    move_embed(model, "cuda")
 
     # get input and kwargs to layer 0
-    # with_kwargs is only supported in PyTorch 2.0
-    # use this Catcher hack for now
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -120,21 +55,19 @@ def run_awq(
 
         def forward(self, inp, **kwargs):
             inps.append(inp)
-            layer_kwargs.update(kwargs)
             raise ValueError  # early exit to break later inference
 
     # patch layer 0 to catch input and kwargs
     layers[0] = Catcher(layers[0])
     try:
-        model(samples.to(next(model.parameters()).device))
+        model(samples)
     except ValueError:  # work with early exit
         pass
     del samples
     layers[0] = layers[0].module  # restore
     inps = inps[0]
 
-    layers[0] = layers[0].cpu()
-    move_embed(model, "cpu")
+    # layers[0] = layers[0].cpu()
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -149,6 +82,8 @@ def run_awq(
         layer = layers[i]
         layer = layer.cuda()
         named_linears = get_named_linears(layer)
+        print("--------------------")
+        print(named_linears)
 
         # firstly, get input features of all linear layers
         def cache_input_hook(m, x, y, name, feat_dict):
@@ -164,13 +99,28 @@ def run_awq(
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
-        inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # get output as next layer's input
-        inps = layer(inps, **layer_kwargs)[0]
+        # print("###########")
+        # print(layer)
+        # print(inps.shape)
+        inps = layer(inps)[0]
         for h in handles:
             h.remove()
         # now solve for scaling and clipping
         input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+        # print("input_feat")
+        # print(input_feat)
+        # # 将张量转换为字符串
+        # str_dict = {k: ' '.join(map(str, v.tolist())) for k, v in input_feat.items()}
+        # # 保存字典为文本文件
+        # with open('input_feat_tensor_dict.txt', 'w') as f:
+        #     for key, value in str_dict.items():
+        #         f.write(f"{key}: {value}\n")
+        # return
+        # print("#########")
+        # for k, v in input_feat.items():
+        #     print(k)
+        #     print(v.shape)
 
         # Clear GPU memory
         torch.cuda.empty_cache()
@@ -180,13 +130,12 @@ def run_awq(
         ):  # if it applies, we should also modify the input_feat with scales
             scales_list = auto_scale_block(
                 layer,
-                layer_kwargs,
                 w_bit=w_bit,
                 q_config=q_config,
                 input_feat=input_feat,
             )
             # apply_scale(layer, scales_list, input_feat_dict=input_feat)
-            apply_scale(layers[i], scales_list, input_feat_dict=input_feat)
+            # apply_scale(layers[i], scales_list, input_feat_dict=input_feat)
             # append prefix to make names global
             awq_results["scale"] += append_str_prefix(
                 scales_list, get_op_name(model, layer) + "."
@@ -209,7 +158,6 @@ def run_awq(
             )
 
         layer = layer.cpu()
-        # Haotian: check activation replacement
         del input_feat
         gc.collect()
         torch.cuda.empty_cache()

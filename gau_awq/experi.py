@@ -1,3 +1,10 @@
+import torch
+import torch.nn as nn
+import tqdm
+import gc
+import functools
+from collections import defaultdict
+from typing import List
 #---------------------------------------------------
 import pandas as pd
 from collections import Counter
@@ -6,19 +13,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch
-from    torch import autograd, einsum
+from torch import autograd, einsum
 import os
-from tqdm import tqdm
 import copy
 from einops import rearrange
-
 import collections
 import torchtext
 import random
 from torchtext.vocab import vocab, GloVe
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch import device
-
 import numpy as np
 from torch import nn, optim
 import torch.nn.functional as F
@@ -28,7 +32,16 @@ import time
 from torch.autograd import Variable
 from rotary_embedding_torch import RotaryEmbedding
 
+from .pre_quant import run_awq, apply_awq
+from .quantizer import (
+    pseudo_quantize_model_weight,
+    real_quantize_model_weight,
+)
 
+from .auto_scale import auto_scale_block, apply_scale
+from .auto_clip import auto_clip_block, apply_clip
+
+#GAU定义相关
 def exists(val):
     return val is not None
 
@@ -113,21 +126,14 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
-my_mask = torch.ones(500, 500).triu(1)
-for i in range(500) :
-    for j in range(500) :
-        if abs(i - j) > 100:
-            my_mask[i,j] = 1
-my_mask = my_mask.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask)
 
-my_mask2 = torch.ones(500, 500).tril(1)
-for i in range(500) :
-    for j in range(500) :
-        if abs(i - j) >= 100:
-            my_mask2[i,j] = 1
-my_mask2 = my_mask2.unsqueeze(0).expand(20, -1, -1)
-#print(my_mask2)
+to_qk_scale = []
+to_hidden_scale = []
+to_out_scale = []
+to_qk_clip = []
+to_hidden_clip = []
+to_out_clip = []
+
 
 class GAU(nn.Module):
     def __init__(
@@ -143,130 +149,65 @@ class GAU(nn.Module):
     ):
         super().__init__()
         hidden_dim = int(expansion_factor * dim)
-
         self.norm = norm_klass(dim)
         self.causal = causal
         self.dropout = nn.Dropout(dropout)
         self.query_key_dim = query_key_dim
-
         self.attn_fn = ReLUSquared() 
-
         self.to_hidden = nn.Sequential(
             nn.Linear(dim, hidden_dim * 2),
             nn.SiLU()
         )
-
         self.to_qk = nn.Sequential(
             nn.Linear(dim, query_key_dim),
             nn.SiLU()
         )
-
         self.offsetscale = OffsetScale(query_key_dim, heads = 2)
-
         self.to_out = nn.Sequential(
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
-        self.my_mask = my_mask
-        self.my_mask2 = my_mask2
 
     def forward(
         self,
         x,
+        weight_scale,
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-        #print("===============================")
-        # print("x")
-        # print(x.shape) 
-        # x [20,500,300]
         normed_x = self.norm(x)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
-
-#do token shifts
+        #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
-        # print("x_shift")
-        # print(x_shift.shape)
-        # x_shift [20,500,150]
-        # print("x_pass")
-        # print(x_pass.shape)
-        # x_pass [20,500,150]
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+        qk_s = weight_scale[0]
+        hidden_s = weight_scale[1]
+        out_s = weight_scale[2]
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
-        # print("normed_x")
-        # print(normed_x.shape)
-        # normed_x [20,500,300]
-        
-
+        normed_x_qk = normed_x.div_(qk_s.view(1,-1))
+        normed_x_qk_hidden = normed_x.div_(hidden_s.view(1,-1))
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
-
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
-        print("qk")
-        print(qk.shape)
-        print("q")
-        print(q.shape)
-        print("k")
-        print(k.shape)
-        return
-
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
-
         sim = einsum('b i d, b j d -> b i j', q, k)
         sim = sim + self.rel_pos_bias(sim)
-
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
-
-        my_mask = self.my_mask.type(torch.bool).to(attn.device)
-        # t_mask = self.my_mask.cpu()
-        # mask1 = t_mask.numpy()
-        # np.savetxt('mask1.txt', mask1[0], fmt='%f') 
-        # #print('prev attn')
-        # #print(attn)
-        # print("attn shape")
-        # print(attn.shape)
-        # t_attn = attn.cpu()
-        # array1 = t_attn.numpy()
-        # array1 = array1[0]
-        # print("array shape")
-        # print(array1.shape)
-        # np.savetxt('array1.txt', array1, fmt='%f')
-        attn = attn * self.my_mask2.to(attn.device)
-        #attn = attn.masked_fill(my_mask, 0.)
-        # #print('post attn')
-        # #print(attn)
-        # t_attn = attn.cpu()
-        # array2 = t_attn.numpy()
-        # array2 = array2[0]
-        # np.savetxt('array2.txt', array2, fmt='%f')
-        # return
-
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
             attn = attn.masked_fill(~mask, 0.)
-
         if self.causal:
             causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
-
         out = self.to_out(out) #out [500,300]
-
         if self.add_residual:
             out = out + x
-
         return out
-
-
 
 class Config(object):
     """配置参数"""
@@ -286,104 +227,26 @@ class Config(object):
         self.hidden = 1024
         self.last_hidden = 512
         self.num_gau = 4
-        self.checkpoint_path = './model.ckpt'
+        self.checkpoint_path = '../model.ckpt'
         self.query_key_dim = 300
+        self.load_quant = False
+        self.no_zero_point = False
+        self.q_group_size = 100
+        self.w_bit = 8
+        self.run_awq = True
+        self.dump_awq = '/root/gau/Gau_transformer/models_save/gau_best_awq_data'
+        self.load_awq = '/root/gau/Gau_transformer/models_save/gau_best_awq.pt'
+        self.model_path = '/root/gau/Gau_transformer/models_save/gau_best.pt'
 
+#读取数据集相关
 torch.manual_seed(1234)
 
-class ImdbDataset(Dataset):
-    def __init__(
-        self, folder_path="./aclImdb", is_train=True, is_small=False
-    ) -> None:
-        super().__init__()
-        self.data, self.labels = self.read_dataset(folder_path, is_train, is_small)
-
-    # 读取数据
-    def read_dataset(
-        self,
-        folder_path,
-        is_train,
-        small
-    ):
-        data, labels = [], []
-        for label in ("pos", "neg"):
-            folder_name = os.path.join(
-                folder_path, "train" if is_train else "test", label
-            )
-            for file in tqdm(os.listdir(folder_name)):
-                with open(os.path.join(folder_name, file), "rb") as f:
-                    text = f.read().decode("utf-8").replace("\n", "").lower()
-                    data.append(text)
-                    labels.append(1 if label == "pos" else 0)
-        
-        return data, labels
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        return self.data[index], int(self.labels[index])
-
-    def get_data(self):
-        return self.data
-
-    def get_labels(self):
-        return self.labels
-
-
-def get_tokenized(data):
-    """获取数据集的词元列表"""
-
-    def tokenizer(text):
-        return [tok.lower() for tok in text.split(" ")]
-
-    return [tokenizer(review) for review in data]
-
-
-def get_vocab(data):
-    """获取数据集的词汇表"""
-    tokenized_data = get_tokenized(data)
-    counter = collections.Counter([tk for st in tokenized_data for tk in st])
-    # 将min_freq设置为5，确保仅包括至少出现5次的单词
-    vocab_freq = {"<UNK>": 0, "<PAD>": 1}
-    # 添加满足词频条件的单词到词汇表，并分配索引
-    for word, freq in counter.items():
-        if freq >= 5:
-            vocab_freq[word] = len(vocab_freq)
-
-    return vocab(vocab_freq)
-
-
-def preprocess_imdb(train_data, vocab,config):
-    """数据预处理，将数据转换成神经网络的输入形式"""
-    max_l = config.pad_size  # 将每条评论通过截断或者补0，使得长度变成500
-
-    def pad(x):
-        return x[:max_l] if len(x) > max_l else x + [1] * (max_l - len(x))
-
-    labels = train_data.get_labels()
-    tokenized_data = get_tokenized(train_data.get_data())
-    vocab_dict = vocab.get_stoi()
-    features = torch.tensor(
-        [pad([vocab_dict.get(word, 0) for word in words]) for words in tokenized_data]
-    )
-    labels = torch.tensor([label for label in labels])
-    return features, labels
-
-def load_data(config):
-    """加载数据集"""
-    train_data = ImdbDataset(folder_path="./aclImdb", is_train=True)
-    test_data = ImdbDataset(folder_path="./aclImdb", is_train=False)
-
-    vocab = get_vocab(train_data.get_data())
-    train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-       
-    test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-
-    train_iter = DataLoader(
-        train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
-    )
-    test_iter = DataLoader(test_set, config.batch_size)
-    return train_iter, test_iter, vocab
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
+gau_scales.cuda()
 
 class Model(nn.Module):
     def __init__(self, config):
@@ -402,65 +265,157 @@ class Model(nn.Module):
 
     def forward(self, x):
         out = self.embedding(x)
-
         out = self.postion_embedding(out)
-        for gau in self.gaus:
-            out = gau(out)
+        for i,gau in self.gaus:
+            out = gau(out,gau_scales[i])
         out = out.view(out.size(0), -1)
         # out = torch.mean(out, 1)
         out = self.fc1(out)
         return out
 
-
-
 # 预先定义配置
 config = Config()
-train_data,test_data,vocabs_size = load_data(config)#加载数据
-config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
+
+# train_data,test_data,vocabs_size = load_data(config)#加载数据
+# config.n_vocab = len(vocabs_size) + 1 #补充词表大小，词表一定要多留出来一个
+config.n_vocab = 46152
+
 model = Model(config)#调用transformer的编码器
 
-
 #load Model 
-stat_dict = torch.load('models_save/gau_best.pt')
+stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
-model.cuda()
+q_config = {
+    "zero_point": not config.no_zero_point,  # by default True
+    "q_group_size": config.q_group_size,  # whether to use group quantization
+}
 
-optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
-criterion = nn.CrossEntropyLoss()#多分类的任务
-batch_size=config.batch_size
+from .awq_utils import get_calib_dataset
+from .awq_utils import get_op_name
+from .awq_utils import append_str_prefix
 
-#记录模型参数量
-# params = list(model.parameters())
-# k = 0
-# for i in params:
-#     l = 1
-#     print("该层的结构：" + str(list(i.size())))
-#     for j in i.size():
-#         l *= j
-#     print("该层参数和：" + str(l))
-#     k = k + l
-# print("总参数数量和：" + str(k))
+def get_named_linears(module):
+    return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
 
-val_acc = 0.0
-val_loss = 0.0
+def get_blocks(model):
+    layers = model.gaus
+    return layers
 
-model.eval() # set the model to evaluation mode
-print(model)
-with torch.no_grad():
-    for i, batch in enumerate(tqdm(test_data)):
-        features, labels = batch
-        features = features.cuda()
-        
-        labels = labels.cuda()
-        outputs = model(features)
+def get_scale_and_clip(model):    
+    layers = get_blocks(model)
+    samples = get_calib_dataset(
+        n_samples=16, block_size=16
+    )
+    print('------------')
+    samples = samples.cuda()
+    
+    print(samples.shape)
+    inps = []
+    layers[0] = layers[0].cuda()
 
-        loss = criterion(outputs, labels) 
-        
-        _, val_pred = torch.max(outputs, 1) 
-        val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
-        val_loss += loss.item()
-print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
+    # get input and kwargs to layer 0
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
 
+        def forward(self, inp, **kwargs):
+            inps.append(inp)
+            raise ValueError  # early exit to break later inference
 
-        
+    # patch layer 0 to catch input and kwargs
+    layers[0] = Catcher(layers[0])
+    try:
+        model(samples)
+    except ValueError:  # work with early exit
+        pass
+    del samples
+    layers[0] = layers[0].module  # restore
+    inps = inps[0]
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    awq_results = {
+        "scale": [],
+        "clip": [],
+    }
+
+    # solve layer by layer
+    for i in tqdm.tqdm(range(len(layers)), desc="Running AWQ..."):
+        torch.cuda.empty_cache()
+        layer = layers[i]
+        layer = layer.cuda()
+        named_linears = get_named_linears(layer)
+
+        # firstly, get input features of all linear layers
+        def cache_input_hook(m, x, y, name, feat_dict):
+            x = x[0]
+            x = x.detach().cpu()
+            feat_dict[name].append(x)
+
+        input_feat = defaultdict(list)
+        handles = []
+        for name in named_linears:
+            handles.append(
+                named_linears[name].register_forward_hook(
+                    functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
+                )
+            )
+        gc.collect()
+        torch.cuda.empty_cache()
+        inps = layer(inps)
+        for h in handles:
+            h.remove()
+        # now solve for scaling and clipping
+        input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+        torch.cuda.empty_cache()
+        scales_list = auto_scale_block(
+            layer,
+            w_bit=8,
+            q_config=q_config,
+            input_feat=input_feat,
+        )
+        awq_results["scale"] += append_str_prefix(
+            scales_list, get_op_name(model, layer) + "."
+        )
+        # Clear GPU memory
+        torch.cuda.empty_cache()
+        clip_list = auto_clip_block(
+            layer,
+            w_bit=8,
+            q_config=q_config,
+            input_feat=input_feat,
+        )
+        apply_clip(layer, clip_list)
+        # append prefix to make names global
+        awq_results["clip"] += append_str_prefix(
+            clip_list, get_op_name(model, layer) + "."
+        )
+        layer = layer.cpu()
+        del input_feat
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print('###########')
+        #print(awq_results)
+        dict_str = '\n'.join(f'{k}: {v}' for k, v in awq_results.items())
+        with open('awq_results_dict.txt', 'w') as f:
+            f.write(dict_str)
+        torch.cuda.empty_cache()
+    return awq_results
+
+def main():
+    config = Config()
+    config.n_vocab = 46152
+    model = Model(config)#调用transformer的编码器
+    stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
+    model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
+    model.eval()
+    model.cuda()
+    awq_results = get_scale_and_clip(model)
+    #scale_list,clip_list = get_scale_and_clip(model)
+
+if __name__ == "__main__":
+    main()

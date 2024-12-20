@@ -6,17 +6,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch
-from torch import autograd, einsum
+from    torch import autograd, einsum
 import os
 from tqdm import tqdm
 import copy
 from einops import rearrange
+
 import collections
 import torchtext
 import random
 from torchtext.vocab import vocab, GloVe
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch import device
+
 import numpy as np
 from torch import nn, optim
 import torch.nn.functional as F
@@ -26,7 +28,7 @@ import time
 from torch.autograd import Variable
 from rotary_embedding_torch import RotaryEmbedding
 
-#GAU定义相关
+
 def exists(val):
     return val is not None
 
@@ -111,6 +113,12 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
+
 class GAU(nn.Module):
     def __init__(
         self,
@@ -157,47 +165,48 @@ class GAU(nn.Module):
     def forward(
         self,
         x,
+        weight_scale,
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-
         normed_x = self.norm(x)
-
         #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+        qk_s = weight_scale[0]
+        hidden_s = weight_scale[1]
+        out_s = weight_scale[2]
+        # qk_s.cuda()
+        # hidden_s.cuda()
+        # out_s.cuda()
+        normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
+        normed_x_qk = normed_x.div_(qk_s.view(1,-1).cuda())
+        normed_x_hidden = normed_x.div_(hidden_s.view(1,-1).cuda())
 
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
-
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
-
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
-
         sim = einsum('b i d, b j d -> b i j', q, k)
         sim = sim + self.rel_pos_bias(sim)
-
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
-
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
             attn = attn.masked_fill(~mask, 0.)
-
         if self.causal:
             causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
-
+        out_out = out.div_(out_s.view(1,-1).cuda())
         out = self.to_out(out) #out [500,300]
-
         if self.add_residual:
             out = out + x
-
         return out
+
+
 
 class Config(object):
     """配置参数"""
@@ -217,10 +226,9 @@ class Config(object):
         self.hidden = 1024
         self.last_hidden = 512
         self.num_gau = 4
-        self.checkpoint_path = '../model.ckpt'
+        self.checkpoint_path = './model.ckpt'
         self.query_key_dim = 300
 
-#读取数据集相关
 torch.manual_seed(1234)
 
 class ImdbDataset(Dataset):
@@ -247,9 +255,6 @@ class ImdbDataset(Dataset):
                     text = f.read().decode("utf-8").replace("\n", "").lower()
                     data.append(text)
                     labels.append(1 if label == "pos" else 0)
-        # random.shuffle(data)
-        # random.shuffle(labels)
-        # 小样本训练，仅用于本机验证
         
         return data, labels
     def __len__(self):
@@ -264,6 +269,7 @@ class ImdbDataset(Dataset):
     def get_labels(self):
         return self.labels
 
+
 def get_tokenized(data):
     """获取数据集的词元列表"""
 
@@ -271,6 +277,7 @@ def get_tokenized(data):
         return [tok.lower() for tok in text.split(" ")]
 
     return [tokenizer(review) for review in data]
+
 
 def get_vocab(data):
     """获取数据集的词汇表"""
@@ -283,8 +290,8 @@ def get_vocab(data):
         if freq >= 5:
             vocab_freq[word] = len(vocab_freq)
 
-    # 构建词汇表对象并返回
     return vocab(vocab_freq)
+
 
 def preprocess_imdb(train_data, vocab,config):
     """数据预处理，将数据转换成神经网络的输入形式"""
@@ -306,16 +313,12 @@ def load_data(config):
     """加载数据集"""
     train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
     test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
-    # print("输出第一句话：")
-    # print(train_data.__getitem__(1))
+
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-    # print("输出第一句话字典编码表示以及序列长度：")
-    # print(train_set.__getitem__(1),train_set.__getitem__(1)[0].shape)
+       
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-    # print(f"训练集大小{train_set.__len__()}")
-    # print(f"测试集大小{test_set.__len__()}")
-    # print(f"词表中单词个数:{len(vocab)}")
+
     train_iter = DataLoader(
         train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
     )
@@ -339,50 +342,52 @@ class Model(nn.Module):
 
     def forward(self, x):
         out = self.embedding(x)
-
         out = self.postion_embedding(out)
+        i = 0
         for gau in self.gaus:
-            out = gau(out)
+            out = gau(out,gau_scales[i])
+            i = i + 1
         out = out.view(out.size(0), -1)
-        # out = torch.mean(out, 1)
         out = self.fc1(out)
         return out
 
+
+
 # 预先定义配置
 config = Config()
-
-# train_data,test_data,vocabs_size = load_data(config)#加载数据
-# config.n_vocab = len(vocabs_size) + 1 #补充词表大小，词表一定要多留出来一个
-config.n_vocab = 46152
-
+train_data,test_data,vocabs_size = load_data(config)#加载数据
+config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
 model = Model(config)#调用transformer的编码器
+
 
 #load Model 
 stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
-# criterion = nn.CrossEntropyLoss()#多分类的任务
-# batch_size=config.batch_size
+model.cuda()
 
-# val_acc = 0.0
-# val_loss = 0.0
+optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
+criterion = nn.CrossEntropyLoss()#多分类的任务
+batch_size=config.batch_size
 
-# model.eval() # set the model to evaluation mode
-# with torch.no_grad():
-#     for i, batch in enumerate(tqdm(test_data)):
-#         features, labels = batch
-#         features = features.cuda()
+val_acc = 0.0
+val_loss = 0.0
+
+model.eval() # set the model to evaluation mode
+with torch.no_grad():
+    for i, batch in enumerate(tqdm(test_data)):
+        features, labels = batch
+        features = features.cuda()
         
-#         labels = labels.cuda()
-#         outputs = model(features)
+        labels = labels.cuda()
+        outputs = model(features)
 
-#         loss = criterion(outputs, labels) 
-#         print(outputs.shape)
+        loss = criterion(outputs, labels) 
         
-#         _, val_pred = torch.max(outputs, 1) 
-#         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
-#         val_loss += loss.item()
-# print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
+        _, val_pred = torch.max(outputs, 1) 
+        val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
+        val_loss += loss.item()
+print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
 
 
         
