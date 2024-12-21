@@ -176,16 +176,41 @@ class GAU(nn.Module):
         qk_s = weight_scale[0]
         hidden_s = weight_scale[1]
         out_s = weight_scale[2]
-        # qk_s.cuda()
-        # hidden_s.cuda()
-        # out_s.cuda()
+
         normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
-        normed_x_qk = normed_x.div_(qk_s.view(1,-1).cuda())
-        normed_x_hidden = normed_x.div_(hidden_s.view(1,-1).cuda())
+        normed_x_qk = normed_x / qk_s.cuda()
+        normed_x_hidden = normed_x / hidden_s.cuda()
 
-        v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
-        qk = self.to_qk(normed_x) #qk [500,128]
+        qk_weight = self.to_qk[0].weight.data
+        hidden_weight = self.to_hidden[0].weight.data
+        out_weight = self.to_out[0].weight.data
+        # print('######################')
+        # print(qk_weight.shape)
+        qk_weight = qk_weight * qk_s.cuda()
+        hidden_weight = hidden_weight * hidden_s.cuda()
+        out_weight = out_weight * out_s.cuda()
+
+        self.to_qk[0].weight.data = qk_weight
+        self.to_hidden[0].weight.data = hidden_weight
+        self.to_out[0].weight.data = out_weight
+        
+        #for quantize
+        # q_row_max = torch.max(torch.abs(q), dim=2).values
+        # k_row_max = torch.max(torch.abs(k), dim=2).values
+        # for batch in range(20):
+        #     for i in range(500):
+        #         q[batch,i,:] = q[batch,i,:] / q_row_scale[batch,i]
+        #         k[batch,i,:] = k[batch,i,:] / k_row_scale[batch,i]
+        # q = torch.clamp(q, min=-127, max=127)
+        # k = torch.clamp(k, min=-127, max=127)
+        # q = q.to(torch.int8)
+        # k = k.to(torch.int8)
+        # q = q.to(torch.float32)
+        # k = k.to(torch.float32)
+
+        v, gate = self.to_hidden(normed_x_hidden).chunk(2, dim = -1) #v, gate [500,600]
+        qk = self.to_qk(normed_x_qk) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
         sim = einsum('b i d, b j d -> b i j', q, k)
@@ -200,8 +225,8 @@ class GAU(nn.Module):
             attn = attn.masked_fill(causal_mask, 0.)
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
-        out_out = out.div_(out_s.view(1,-1).cuda())
-        out = self.to_out(out) #out [500,300]
+        out_out = out / out_s.cuda()
+        out = self.to_out(out_out) #out [500,300]
         if self.add_residual:
             out = out + x
         return out
@@ -374,6 +399,15 @@ val_acc = 0.0
 val_loss = 0.0
 
 model.eval() # set the model to evaluation mode
+
+loaded_awq_0 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_0.pt')
+print(loaded_awq_0['scale'][0][2].shape)
+print(loaded_awq_0['scale'][0][2])
+#0: to_qk  1:to_hidden  2:to_out
+gau_scales[0][0] = loaded_awq_0['scale'][0][2]
+gau_scales[0][1] = loaded_awq_0['scale'][1][2]
+gau_scales[0][2] = loaded_awq_0['scale'][2][2]
+
 with torch.no_grad():
     for i, batch in enumerate(tqdm(test_data)):
         features, labels = batch

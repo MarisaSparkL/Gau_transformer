@@ -417,12 +417,20 @@ def main():
     layers[0] = layers[0].module  # restore
     inps = inps[0]
     print('############')
-    print(inps)
-    print(inps.shape)
+    # print(inps)
+    # print(inps.shape)
 
     gc.collect()
     torch.cuda.empty_cache()
     awq_results_0 = get_scale_and_clip(model,layers,inps,0)
+    awq_results_1 = get_scale_and_clip(model,layers,inps,1)
+    awq_results_2 = get_scale_and_clip(model,layers,inps,2)
+    awq_results_3 = get_scale_and_clip(model,layers,inps,3)
+
+    torch.save(awq_results_0, '/root/gau/Gau_transformer/models_save/awq_results_0.pt')
+    torch.save(awq_results_1, '/root/gau/Gau_transformer/models_save/awq_results_1.pt')
+    torch.save(awq_results_2, '/root/gau/Gau_transformer/models_save/awq_results_2.pt')
+    torch.save(awq_results_3, '/root/gau/Gau_transformer/models_save/awq_results_3.pt')
 
     #scale_list,clip_list = get_scale_and_clip(model)
 
