@@ -126,14 +126,11 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
-
-to_qk_scale = []
-to_hidden_scale = []
-to_out_scale = []
-to_qk_clip = []
-to_hidden_clip = []
-to_out_clip = []
-
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
 
 class GAU(nn.Module):
     def __init__(
@@ -149,24 +146,31 @@ class GAU(nn.Module):
     ):
         super().__init__()
         hidden_dim = int(expansion_factor * dim)
+
         self.norm = norm_klass(dim)
         self.causal = causal
         self.dropout = nn.Dropout(dropout)
         self.query_key_dim = query_key_dim
+
         self.attn_fn = ReLUSquared() 
+
         self.to_hidden = nn.Sequential(
             nn.Linear(dim, hidden_dim * 2),
             nn.SiLU()
         )
+
         self.to_qk = nn.Sequential(
             nn.Linear(dim, query_key_dim),
             nn.SiLU()
         )
+
         self.offsetscale = OffsetScale(query_key_dim, heads = 2)
+
         self.to_out = nn.Sequential(
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
+
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
@@ -185,9 +189,14 @@ class GAU(nn.Module):
         qk_s = weight_scale[0]
         hidden_s = weight_scale[1]
         out_s = weight_scale[2]
+        # qk_s.cuda()
+        # hidden_s.cuda()
+        # out_s.cuda()
+        normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
-        normed_x_qk = normed_x.div_(qk_s.view(1,-1))
-        normed_x_qk_hidden = normed_x.div_(hidden_s.view(1,-1))
+        normed_x_qk = normed_x.div_(qk_s.view(1,-1).cuda())
+        normed_x_hidden = normed_x.div_(hidden_s.view(1,-1).cuda())
+
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
@@ -204,6 +213,7 @@ class GAU(nn.Module):
             attn = attn.masked_fill(causal_mask, 0.)
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
+        out_out = out.div_(out_s.view(1,-1).cuda())
         out = self.to_out(out) #out [500,300]
         if self.add_residual:
             out = out + x
@@ -246,7 +256,7 @@ gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)]
             ]
-gau_scales.cuda()
+# gau_scales.cuda()
 
 class Model(nn.Module):
     def __init__(self, config):
@@ -266,8 +276,10 @@ class Model(nn.Module):
     def forward(self, x):
         out = self.embedding(x)
         out = self.postion_embedding(out)
-        for i,gau in self.gaus:
+        i = 0
+        for gau in self.gaus:
             out = gau(out,gau_scales[i])
+            i = i + 1
         out = out.view(out.size(0), -1)
         # out = torch.mean(out, 1)
         out = self.fc1(out)
@@ -302,25 +314,96 @@ def get_blocks(model):
     layers = model.gaus
     return layers
 
-def get_scale_and_clip(model):    
+def get_scale_and_clip(model,layers,inps,level):    
+
+    awq_results = {
+        "scale": [],
+        "clip": [],
+    }
+
+    torch.cuda.empty_cache()
+    layer = layers[level]
+    layer = layer.cuda()
+    named_linears = get_named_linears(layer)
+
+    # firstly, get input features of all linear layers
+    def cache_input_hook(m, x, y, name, feat_dict):
+        x = x[0]
+        x = x.detach().cpu()
+        feat_dict[name].append(x)
+
+    input_feat = defaultdict(list)
+    handles = []
+    for name in named_linears:
+        handles.append(
+            named_linears[name].register_forward_hook(
+                functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
+            )
+        )
+    gc.collect()
+    torch.cuda.empty_cache()
+    inps = layer(inps,gau_scales[level])
+    for h in handles:
+        h.remove()
+    # now solve for scaling and clipping
+    input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+    torch.cuda.empty_cache()
+    scales_list = auto_scale_block(
+        layer,
+        w_bit=8,
+        q_config=q_config,
+        input_feat=input_feat,
+    )
+    awq_results["scale"] += append_str_prefix(
+        scales_list, get_op_name(model, layer) + "."
+    )
+    # Clear GPU memory
+    torch.cuda.empty_cache()
+    clip_list = auto_clip_block(
+        layer,
+        w_bit=8,
+        q_config=q_config,
+        input_feat=input_feat,
+    )
+    apply_clip(layer, clip_list)
+    # append prefix to make names global
+    awq_results["clip"] += append_str_prefix(
+        clip_list, get_op_name(model, layer) + "."
+    )
+    layer = layer.cpu()
+    del input_feat
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    dict_str = '\n'.join(f'{k}: {v}' for k, v in awq_results.items())
+    with open('awq_results_dict.txt', 'w') as f:
+        f.write(dict_str)
+    torch.cuda.empty_cache()
+    return awq_results
+
+def main():
+    config = Config()
+    config.n_vocab = 46152
+    model = Model(config)#调用transformer的编码器
+    stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
+    model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
+    model.eval()
+    model.cuda()
     layers = get_blocks(model)
     samples = get_calib_dataset(
         n_samples=16, block_size=16
     )
-    print('------------')
     samples = samples.cuda()
-    
-    print(samples.shape)
-    inps = []
     layers[0] = layers[0].cuda()
 
+    inps = []
     # get input and kwargs to layer 0
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
 
-        def forward(self, inp, **kwargs):
+        def forward(self, inp, weight_scale = None, **kwargs):
             inps.append(inp)
             raise ValueError  # early exit to break later inference
 
@@ -333,88 +416,14 @@ def get_scale_and_clip(model):
     del samples
     layers[0] = layers[0].module  # restore
     inps = inps[0]
+    print('############')
+    print(inps)
+    print(inps.shape)
 
     gc.collect()
     torch.cuda.empty_cache()
+    awq_results_0 = get_scale_and_clip(model,layers,inps,0)
 
-    awq_results = {
-        "scale": [],
-        "clip": [],
-    }
-
-    # solve layer by layer
-    for i in tqdm.tqdm(range(len(layers)), desc="Running AWQ..."):
-        torch.cuda.empty_cache()
-        layer = layers[i]
-        layer = layer.cuda()
-        named_linears = get_named_linears(layer)
-
-        # firstly, get input features of all linear layers
-        def cache_input_hook(m, x, y, name, feat_dict):
-            x = x[0]
-            x = x.detach().cpu()
-            feat_dict[name].append(x)
-
-        input_feat = defaultdict(list)
-        handles = []
-        for name in named_linears:
-            handles.append(
-                named_linears[name].register_forward_hook(
-                    functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
-                )
-            )
-        gc.collect()
-        torch.cuda.empty_cache()
-        inps = layer(inps)
-        for h in handles:
-            h.remove()
-        # now solve for scaling and clipping
-        input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
-        torch.cuda.empty_cache()
-        scales_list = auto_scale_block(
-            layer,
-            w_bit=8,
-            q_config=q_config,
-            input_feat=input_feat,
-        )
-        awq_results["scale"] += append_str_prefix(
-            scales_list, get_op_name(model, layer) + "."
-        )
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-        clip_list = auto_clip_block(
-            layer,
-            w_bit=8,
-            q_config=q_config,
-            input_feat=input_feat,
-        )
-        apply_clip(layer, clip_list)
-        # append prefix to make names global
-        awq_results["clip"] += append_str_prefix(
-            clip_list, get_op_name(model, layer) + "."
-        )
-        layer = layer.cpu()
-        del input_feat
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        print('###########')
-        #print(awq_results)
-        dict_str = '\n'.join(f'{k}: {v}' for k, v in awq_results.items())
-        with open('awq_results_dict.txt', 'w') as f:
-            f.write(dict_str)
-        torch.cuda.empty_cache()
-    return awq_results
-
-def main():
-    config = Config()
-    config.n_vocab = 46152
-    model = Model(config)#调用transformer的编码器
-    stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
-    model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
-    model.eval()
-    model.cuda()
-    awq_results = get_scale_and_clip(model)
     #scale_list,clip_list = get_scale_and_clip(model)
 
 if __name__ == "__main__":
