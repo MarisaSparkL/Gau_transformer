@@ -182,9 +182,18 @@ class GAU(nn.Module):
         normed_x_qk = normed_x / qk_s.cuda()
         normed_x_hidden = normed_x / hidden_s.cuda()
 
+        qk_origin = self.to_qk(normed_x)
+        t_qk_origin = qk_origin.cpu()
+        t_qk_origin = t_qk_origin.numpy()
+        np.savetxt('t_qk_origin.txt', t_qk_origin, fmt='%f')
+
         qk_weight = self.to_qk[0].weight.data
         hidden_weight = self.to_hidden[0].weight.data
         out_weight = self.to_out[0].weight.data
+
+        t_qk_weight_origin = qk_weight_origin.cpu()
+        t_qk_weight_origin = t_qk_weight_origin.numpy()
+        np.savetxt('t_qk_weight_origin.txt', t_qk_weight_origin, fmt='%f')
         # print('######################')
         # print(qk_weight.shape)
         qk_weight = qk_weight * qk_s.cuda()
@@ -194,6 +203,11 @@ class GAU(nn.Module):
         self.to_qk[0].weight.data = qk_weight
         self.to_hidden[0].weight.data = hidden_weight
         self.to_out[0].weight.data = out_weight
+
+        t_qk_weight_after = self.to_qk[0].weight.data.cpu()
+        t_qk_weight_after = t_qk_weight_after.numpy()
+        np.savetxt('t_qk_weight_after.txt', t_qk_weight_after, fmt='%f')
+        return
         
         #for quantize
         # q_row_max = torch.max(torch.abs(q), dim=2).values
