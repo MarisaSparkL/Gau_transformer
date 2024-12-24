@@ -203,7 +203,7 @@ class GAU(nn.Module):
         # print(normed_x.shape)
         # normed_x [20,500,300]
         
-
+        #to_hidden weight [1200,300]
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
 
         qk = self.to_qk(normed_x) #qk [500,128]

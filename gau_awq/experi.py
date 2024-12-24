@@ -416,9 +416,6 @@ def main():
     del samples
     layers[0] = layers[0].module  # restore
     inps = inps[0]
-    print('############')
-    # print(inps)
-    # print(inps.shape)
 
     gc.collect()
     torch.cuda.empty_cache()

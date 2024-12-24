@@ -118,6 +118,12 @@ gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)]
             ]
+# 0: [1200,3,1] 1:[128,3,1] 2:[300,6,1]
+gau_clips = [[torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
+            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
+            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
+            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)]
+            ]
 
 class GAU(nn.Module):
     def __init__(
@@ -133,31 +139,24 @@ class GAU(nn.Module):
     ):
         super().__init__()
         hidden_dim = int(expansion_factor * dim)
-
         self.norm = norm_klass(dim)
         self.causal = causal
         self.dropout = nn.Dropout(dropout)
         self.query_key_dim = query_key_dim
-
         self.attn_fn = ReLUSquared() 
-
         self.to_hidden = nn.Sequential(
             nn.Linear(dim, hidden_dim * 2),
             nn.SiLU()
         )
-
         self.to_qk = nn.Sequential(
             nn.Linear(dim, query_key_dim),
             nn.SiLU()
         )
-
         self.offsetscale = OffsetScale(query_key_dim, heads = 2)
-
         self.to_out = nn.Sequential(
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
@@ -168,9 +167,9 @@ class GAU(nn.Module):
         weight_scale,
         mask = None
     ):
+        save_log = False
         seq_len, device = x.shape[-2], x.device
         normed_x = self.norm(x)
-        #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
         qk_s = weight_scale[0]
@@ -179,37 +178,69 @@ class GAU(nn.Module):
 
         normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
+
+        if save_log:
+            t_normed_x = normed_x[0].cpu()
+            t_normed_x = t_normed_x.numpy()
+            np.savetxt('t_normed_x.txt', t_normed_x, fmt='%f')
+
         normed_x_qk = normed_x / qk_s.cuda()
         normed_x_hidden = normed_x / hidden_s.cuda()
 
-        qk_origin = self.to_qk(normed_x)
-        t_qk_origin = qk_origin.cpu()
-        t_qk_origin = t_qk_origin.numpy()
-        np.savetxt('t_qk_origin.txt', t_qk_origin, fmt='%f')
+        if save_log:
+            t_normed_x_qk = normed_x_qk[0].cpu()
+            t_normed_x_qk = t_normed_x_qk.numpy()
+            np.savetxt('t_normed_x_qk.txt', t_normed_x_qk, fmt='%f')
 
-        qk_weight = self.to_qk[0].weight.data
-        hidden_weight = self.to_hidden[0].weight.data
-        out_weight = self.to_out[0].weight.data
+        if save_log:
+            t_normed_x_hidden = normed_x_hidden[0].cpu()
+            t_normed_x_hidden = t_normed_x_hidden.numpy()
+            np.savetxt('t_normed_x_hidden.txt', t_normed_x_hidden, fmt='%f')
 
-        t_qk_weight_origin = qk_weight_origin.cpu()
-        t_qk_weight_origin = t_qk_weight_origin.numpy()
-        np.savetxt('t_qk_weight_origin.txt', t_qk_weight_origin, fmt='%f')
-        # print('######################')
-        # print(qk_weight.shape)
+        if save_log:
+            qk_origin = self.to_qk(normed_x)
+            t_qk_origin = qk_origin[1].cpu()
+            t_qk_origin = t_qk_origin.numpy()
+            np.savetxt('t_qk_origin.txt', t_qk_origin, fmt='%f')
+
+        if save_log:
+            v_o, g_o = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
+            v_origin = v_o[1].cpu()
+            v_origin = v_origin.numpy()
+            np.savetxt('v_origin.txt', v_origin, fmt='%f')
+
+        origin_qk_weight = self.to_qk[0].weight.data
+        origin_hidden_weight = self.to_hidden[0].weight.data
+        origin_out_weight = self.to_out[0].weight.data
+
+        qk_weight = origin_qk_weight
+        hidden_weight = origin_hidden_weight
+        out_weight = origin_out_weight
+
+        if save_log:
+            t_qk_weight_origin = qk_weight.cpu()
+            t_qk_weight_origin = t_qk_weight_origin.numpy()
+            np.savetxt('t_qk_weight_origin.txt', t_qk_weight_origin, fmt='%f')
+            t_hidden_weight_origin = hidden_weight.cpu()
+            t_hidden_weight_origin = t_hidden_weight_origin.numpy()
+            np.savetxt('t_hidden_weight_origin.txt', t_hidden_weight_origin, fmt='%f')
+
         qk_weight = qk_weight * qk_s.cuda()
         hidden_weight = hidden_weight * hidden_s.cuda()
         out_weight = out_weight * out_s.cuda()
 
         self.to_qk[0].weight.data = qk_weight
         self.to_hidden[0].weight.data = hidden_weight
-        self.to_out[0].weight.data = out_weight
 
-        t_qk_weight_after = self.to_qk[0].weight.data.cpu()
-        t_qk_weight_after = t_qk_weight_after.numpy()
-        np.savetxt('t_qk_weight_after.txt', t_qk_weight_after, fmt='%f')
-        return
+        if save_log:
+            t_qk_weight_after = self.to_qk[0].weight.data.cpu()
+            t_qk_weight_after = t_qk_weight_after.numpy()
+            np.savetxt('t_qk_weight_after.txt', t_qk_weight_after, fmt='%f')
+            t_hidden_weight_after = self.to_hidden[0].weight.data.cpu()
+            t_hidden_weight_after = t_hidden_weight_after.numpy()
+            np.savetxt('t_hidden_weight_after.txt', t_hidden_weight_after, fmt='%f')
         
-        #for quantize
+        # quantize activation
         # q_row_max = torch.max(torch.abs(q), dim=2).values
         # k_row_max = torch.max(torch.abs(k), dim=2).values
         # for batch in range(20):
@@ -225,6 +256,15 @@ class GAU(nn.Module):
 
         v, gate = self.to_hidden(normed_x_hidden).chunk(2, dim = -1) #v, gate [500,600]
         qk = self.to_qk(normed_x_qk) #qk [500,128]
+
+        if save_log:
+            v_after = v[1].cpu()
+            v_after = v_after.numpy()
+            np.savetxt('v_after.txt', v_after, fmt='%f')
+            t_qk_after = qk[1].cpu()
+            t_qk_after = t_qk_after.numpy()
+            np.savetxt('t_qk_after.txt', t_qk_after, fmt='%f')
+
         q, k = self.offsetscale(qk) #q, k [500,128]
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
         sim = einsum('b i d, b j d -> b i j', q, k)
@@ -240,11 +280,30 @@ class GAU(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
         out_out = out / out_s.cuda()
+
+        out1 = self.to_out(out)
+        
+        if save_log:
+            out_origin = out1[0].cpu()
+            out_origin = out_origin.numpy()
+            np.savetxt('out_origin.txt', out_origin, fmt='%f')
+
+        self.to_out[0].weight.data = out_weight
         out = self.to_out(out_out) #out [500,300]
+
+        if save_log:
+            out_after = out[0].cpu()
+            out_after = out_after.numpy()
+            np.savetxt('out_after.txt', out_after, fmt='%f')    
+
         if self.add_residual:
             out = out + x
-        return out
 
+        self.to_qk[0].weight.data = origin_qk_weight
+        self.to_hidden[0].weight.data = origin_hidden_weight
+        self.to_out[0].weight.data = origin_out_weight
+
+        return out
 
 
 class Config(object):
@@ -308,7 +367,6 @@ class ImdbDataset(Dataset):
     def get_labels(self):
         return self.labels
 
-
 def get_tokenized(data):
     """获取数据集的词元列表"""
 
@@ -316,7 +374,6 @@ def get_tokenized(data):
         return [tok.lower() for tok in text.split(" ")]
 
     return [tokenizer(review) for review in data]
-
 
 def get_vocab(data):
     """获取数据集的词汇表"""
@@ -330,7 +387,6 @@ def get_vocab(data):
             vocab_freq[word] = len(vocab_freq)
 
     return vocab(vocab_freq)
-
 
 def preprocess_imdb(train_data, vocab,config):
     """数据预处理，将数据转换成神经网络的输入形式"""
@@ -390,20 +446,61 @@ class Model(nn.Module):
         out = self.fc1(out)
         return out
 
-
-
 # 预先定义配置
 config = Config()
 train_data,test_data,vocabs_size = load_data(config)#加载数据
 config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
 model = Model(config)#调用transformer的编码器
+loaded_awq_0 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_0.pt')
+
+gau_scales[0][0] = loaded_awq_0['scale'][0][2]
+gau_scales[0][1] = loaded_awq_0['scale'][1][2]
+gau_scales[0][2] = loaded_awq_0['scale'][2][2]
+
+gau_clips[0][0] = loaded_awq_0['clip'][0][1]
+gau_clips[0][1] = loaded_awq_0['clip'][1][1]
+gau_clips[0][2] = loaded_awq_0['clip'][2][1]
+
+def modify_weight(model,level):
+    clip_hidden = gau_clips[level][0].cuda()
+    clip_qk = gau_clips[level][1].cuda()
+    clip_out = gau_clips[level][2].cuda()
+    layer = model.gaus[level]
+    layer_hidden_data = layer.to_hidden[0].weight.data
+    layer_qk_data = layer.to_qk[0].weight.data
+    layer_out_data = layer.to_out[0].weight.data
+    #modify to_hidden
+    clipped_layer_hidden_data = layer_hidden_data
+    for row in range(1200):
+        for group in range(3):
+            clipped_layer_hidden_data[row][group*100 : (group * 100 + 100)] = torch.clamp(clipped_layer_hidden_data[row][group*100 : (group * 100 + 100)], min= -clip_hidden[row][group], max=clip_hidden[row][group])
+    model.gaus[level].to_hidden[0].weight.data = clipped_layer_hidden_data
+
+    #modify to_qk
+    clipped_layer_qk_data = layer_qk_data
+    print('origin qk')
+    print(clipped_layer_qk_data)
+    for row in range(128):
+        for group in range(3):
+            clipped_layer_qk_data[row][group*100 : (group * 100 + 100)] = torch.clamp(clipped_layer_qk_data[row][group*100 : (group * 100 + 100)], min= -clip_qk[row][group], max=clip_qk[row][group])
+    model.gaus[level].to_qk[0].weight.data = clipped_layer_qk_data
+
+    #modify to_out
+    clipped_layer_out_data = layer_out_data
+    for row in range(300):
+        for group in range(6):
+            clipped_layer_out_data[row][group*100 : (group * 100 + 100)] = torch.clamp(clipped_layer_out_data[row][group*100 : (group * 100 + 100)], min= -clip_out[row][group], max=clip_out[row][group])
+    model.gaus[level].to_out[0].weight.data = clipped_layer_out_data
+
 
 
 #load Model 
 stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
-
 model.cuda()
+model.eval() # set the model to evaluation mode
+
+modify_weight(model,0)
 
 optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
 criterion = nn.CrossEntropyLoss()#多分类的任务
@@ -412,15 +509,24 @@ batch_size=config.batch_size
 val_acc = 0.0
 val_loss = 0.0
 
-model.eval() # set the model to evaluation mode
 
-loaded_awq_0 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_0.pt')
-print(loaded_awq_0['scale'][0][2].shape)
-print(loaded_awq_0['scale'][0][2])
-#0: to_qk  1:to_hidden  2:to_out
-gau_scales[0][0] = loaded_awq_0['scale'][0][2]
-gau_scales[0][1] = loaded_awq_0['scale'][1][2]
-gau_scales[0][2] = loaded_awq_0['scale'][2][2]
+
+
+# print(loaded_awq_0['scale'][0][2].shape)
+# print(loaded_awq_0['scale'][0][2])
+
+# print(loaded_awq_0['scale'])
+# print(loaded_awq_0['clip'])
+# print('##########################')
+# print(loaded_awq_0['clip'][0][1].shape)
+# print(loaded_awq_0['clip'][1][1].shape)
+# print(loaded_awq_0['clip'][2][1].shape)
+# scale 0:to_qk 1:to_hidden 2:to_out
+# weight to_hidden: [1200,300] to_qk: [128,300] to_out: [300,600]
+# clip 0:to_hidden 1:to_qk 2:to_out
+# 0: [1200,3,1] 1:[128,3,1] 2:[300,6,1]
+
+end_point = 1250
 
 with torch.no_grad():
     for i, batch in enumerate(tqdm(test_data)):
@@ -430,11 +536,19 @@ with torch.no_grad():
         labels = labels.cuda()
         outputs = model(features)
 
-        loss = criterion(outputs, labels) 
+        # output_origin = outputs[0].cpu()
+        # output_origin = output_origin.numpy()
+        # np.savetxt('output_after.txt', output_origin, fmt='%f')
+        loss = criterion(outputs, labels)
         
         _, val_pred = torch.max(outputs, 1) 
         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
         val_loss += loss.item()
+        # print(i)
+        # print(val_acc)
+        # print(val_loss)
+        if i == end_point:
+            break
 print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
 
 
