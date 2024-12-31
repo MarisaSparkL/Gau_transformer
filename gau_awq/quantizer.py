@@ -29,6 +29,10 @@ def pseudo_quantize_tensor(
         # print(q_group_size)
         assert org_w_shape[-1] % q_group_size == 0
         w = w.reshape(-1, q_group_size)
+    if w.dim() != 2 :
+        print('!!!!!!!!!')
+        print(w.dim())
+        print(w)
     assert w.dim() == 2
     if zero_point:
         max_val = w.amax(dim=1, keepdim=True)
@@ -38,7 +42,7 @@ def pseudo_quantize_tensor(
         scales = (max_val - min_val).clamp(min=1e-5) / max_int
         zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
     else:  # we actually never used this
-        assert min_val is None
+        # assert min_val is None
         max_val = w.abs().amax(dim=1, keepdim=True)
         max_val = max_val.clamp(min=1e-5)
         max_int = 2 ** (n_bit - 1) - 1
@@ -85,45 +89,44 @@ def pseudo_quantize_model_weight(
             )
             m.cpu()
 
+# @torch.no_grad()
+# def real_quantize_model_weight(model, w_bit, q_config, init_only=False):
+#     from .qmodule import WQLinear
+#     from .pre_quant import get_blocks, get_named_linears
 
-@torch.no_grad()
-def real_quantize_model_weight(model, w_bit, q_config, init_only=False):
-    from .qmodule import WQLinear
-    from .pre_quant import get_blocks, get_named_linears
+#     assert q_config["zero_point"], "We only support zero_point quantization now."
 
-    assert q_config["zero_point"], "We only support zero_point quantization now."
+#     layers = get_blocks(model)
+#     for i in tqdm(
+#         range(len(layers)),
+#         desc="real weight quantization..." + ("(init only)" if init_only else ""),
+#     ):
+#         layer = layers[i]
+#         named_linears = get_named_linears(layer)
+#         scale_activations(layer)
 
-    layers = get_blocks(model)
-    for i in tqdm(
-        range(len(layers)),
-        desc="real weight quantization..." + ("(init only)" if init_only else ""),
-    ):
-        layer = layers[i]
-        named_linears = get_named_linears(layer)
-        scale_activations(layer)
+#         for name, module in named_linears.items():
+#             if init_only:
+#                 q_linear = WQLinear.from_linear(
+#                     module, w_bit, q_config["q_group_size"], True
+#                 )
+#                 q_linear.to(next(layer.parameters()).device)
+#                 set_op_by_name(layer, name, q_linear)
+#             else:
+#                 module.cuda()
+#                 module.weight.data, scales, zeros = pseudo_quantize_tensor(
+#                     module.weight.data, n_bit=w_bit, get_scale_zp=True, **q_config
+#                 )
+#                 # scales = scales.t().contiguous()
+#                 # zeros = zeros.t().contiguous()
+#                 q_linear = WQLinear.from_linear(
+#                     module, w_bit, q_config["q_group_size"], False, scales, zeros
+#                 )
+#                 module.cpu()
+#                 q_linear.to(next(layer.parameters()).device)
+#                 set_op_by_name(layer, name, q_linear)
+#                 torch.cuda.empty_cache()
+#                 gc.collect()
 
-        for name, module in named_linears.items():
-            if init_only:
-                q_linear = WQLinear.from_linear(
-                    module, w_bit, q_config["q_group_size"], True
-                )
-                q_linear.to(next(layer.parameters()).device)
-                set_op_by_name(layer, name, q_linear)
-            else:
-                module.cuda()
-                module.weight.data, scales, zeros = pseudo_quantize_tensor(
-                    module.weight.data, n_bit=w_bit, get_scale_zp=True, **q_config
-                )
-                # scales = scales.t().contiguous()
-                # zeros = zeros.t().contiguous()
-                q_linear = WQLinear.from_linear(
-                    module, w_bit, q_config["q_group_size"], False, scales, zeros
-                )
-                module.cpu()
-                q_linear.to(next(layer.parameters()).device)
-                set_op_by_name(layer, name, q_linear)
-                torch.cuda.empty_cache()
-                gc.collect()
-
-    torch.cuda.empty_cache()
-    gc.collect()
+#     torch.cuda.empty_cache()
+#     gc.collect()

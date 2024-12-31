@@ -28,7 +28,7 @@ import time
 from torch.autograd import Variable
 from rotary_embedding_torch import RotaryEmbedding
 
-
+#GAU定义相关
 def exists(val):
     return val is not None
 
@@ -118,18 +118,18 @@ gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)],
             [torch.ones(300),torch.ones(300),torch.ones(600)]
             ]
-# 0: [1200,3,1] 1:[128,3,1] 2:[300,6,1]
-gau_clips = [[torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-            [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)]
+
+gau_clips = [[torch.ones(1200),torch.ones(128),torch.ones(300)],
+            [torch.ones(1200),torch.ones(128),torch.ones(300)],
+            [torch.ones(1200),torch.ones(128),torch.ones(300)],
+            [torch.ones(1200),torch.ones(128),torch.ones(300)]
             ]
 
 weight_quant_params = [
-    [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-    [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-    [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)],
-    [torch.ones(1200,3),torch.ones(128,3),torch.ones(300,6)]
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)]
 ]
 
 class GAU(nn.Module):
@@ -172,119 +172,176 @@ class GAU(nn.Module):
         self,
         x,
         weight_scale,
-        quant_param,
+        quant_params,
         mask = None
     ):
-        save_log = False
-        seq_len, device = x.shape[-2], x.device
-        normed_x = self.norm(x)
-        x_shift, x_pass = normed_x.chunk(2, dim = -1)
-        x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+        with torch.no_grad():
+            qk_s = weight_scale[0]
+            hidden_s = weight_scale[1]
+            out_s = weight_scale[2]
+            
+            hidden_params = quant_params[0].cuda()
+            qk_params = quant_params[1].cuda()
+            out_params = quant_params[2].cuda()
 
-        normed_x.cuda()
-        normed_x = torch.cat((x_shift, x_pass), dim = -1)
+            seq_len, device = x.shape[-2], x.device
+            normed_x = self.norm(x)
+            # print('normed_x')
+            # print(normed_x)
+            
+            # print('normed_x_qk')
+            # print(normed_x_qk)
+            # print('normed_x_hidden')
+            # print(normed_x_hidden)
 
-        normed_x_qk = normed_x / qk_s.cuda()
-        normed_x_hidden = normed_x / hidden_s.cuda()
+            x_shift, x_pass = normed_x.chunk(2, dim = -1)
+            x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
 
-        #quantize_normed_x
-        normed_x_row_max = torch.max(torch.abs(normed_x), dim=2).values
-        normed_x_row_scale = normed_x_row_max / 127
-        for batch in range(20):
-            for i in range(500):
-                normed_x[batch,i,:] = normed_x[batch,i,:] / normed_x_row_scale[batch,i]
-        normed_x = torch.clamp(normed_x, min=-127, max=127)
-        normed_x = normed_x.to(torch.int8)
-        normed_x = normed_x.to(torch.float32)
+            normed_x.cuda()
+            normed_x = torch.cat((x_shift, x_pass), dim = -1)
 
-        qk_s = weight_scale[0]
-        hidden_s = weight_scale[1]
-        out_s = weight_scale[2]
+            normed_x_qk = normed_x / (qk_s.view(1,-1).cuda())
+            normed_x_hidden = normed_x / (hidden_s.view(1,-1).cuda())
 
-        hidden_quant_param = quant_param[0]
-        qk_quant_params = quant_param[1]
-        out_quant_params = quant_param[2]
+            # #quantize_normed_x
+            # normed_x_row_max = torch.max(torch.abs(normed_x), dim=2).values
+            # normed_x_row_scale = normed_x_row_max / 127
+            # for batch in range(20):
+            #     for i in range(500):
+            #         normed_x[batch,i,:] = normed_x[batch,i,:] / normed_x_row_scale[batch,i]
+            # normed_x = torch.clamp(normed_x, min=-127, max=127)
+            # normed_x = normed_x.to(torch.int8)
+            # normed_x = normed_x.to(torch.float32)
 
-        if save_log:
-            t_normed_x = normed_x[0].cpu()
-            t_normed_x = t_normed_x.numpy()
-            np.savetxt('t_normed_x.txt', t_normed_x, fmt='%f')  
+            #quantize_normed_x_qk
+            normed_x_qk_row_max = torch.max(torch.abs(normed_x_qk), dim=2).values
+            normed_x_qk_row_scale = normed_x_qk_row_max / 127
+            for batch in range(20):
+                for i in range(500):
+                    normed_x_qk[batch,i,:] = normed_x_qk[batch,i,:] / normed_x_qk_row_scale[batch,i]
+            normed_x_qk = torch.clamp(normed_x_qk, min=-127, max=127)
+            normed_x_qk = normed_x_qk.to(torch.int8)
+            normed_x_qk = normed_x_qk.to(torch.float32)
 
-        v, gate = self.to_hidden(normed_x_hidden).chunk(2, dim = -1) #v, gate [500,600]
-        qk = self.to_qk(normed_x_qk) #qk [500,128]
+            #quantize_normed_x_hidden
+            normed_x_hidden_row_max = torch.max(torch.abs(normed_x_hidden), dim=2).values
+            normed_x_hidden_row_scale = normed_x_hidden_row_max / 127
+            for batch in range(20):
+                for i in range(500):
+                    normed_x_hidden[batch,i,:] = normed_x_hidden[batch,i,:] / normed_x_hidden_row_scale[batch,i]
+            normed_x_hidden = torch.clamp(normed_x_hidden, min=-127, max=127)
+            normed_x_hidden = normed_x_hidden.to(torch.int8)
+            normed_x_hidden = normed_x_hidden.to(torch.float32)
 
-        if save_log:
-            v_after = v[1].cpu()
-            v_after = v_after.numpy()
-            np.savetxt('v_after.txt', v_after, fmt='%f')
-            t_qk_after = qk[1].cpu()
-            t_qk_after = t_qk_after.numpy()
-            np.savetxt('t_qk_after.txt', t_qk_after, fmt='%f')
+            v_gate = self.to_hidden(normed_x_hidden)
+            # print('v_gate')
+            # print(v_gate)
+            #v_gate反量化
+            for batch in range(20):
+                v_gate_quant_matrix = torch.outer(normed_x_hidden_row_scale[batch], hidden_params)
+                v_gate[batch] = v_gate[batch] * v_gate_quant_matrix
 
-        q, k = self.offsetscale(qk) #q, k [500,128]
-        for row in range(128):
-            for group in range(3):
-                t = layer_qk_data[row][group*100 : (group * 100 + 100)]
-                t_max = torch.max(abs(t))
-                t_quant_scale = t_max / 127
-                t = t / t_quant_scale
-                t = t.to(torch.int8)
-                t = t.to(torch.float32)
-                layer_qk_data[row][group*100 : (group * 100 + 100)] = t
-                weight_quant_params[level][1][row][group] = t_quant_scale
+            v, gate = v_gate.chunk(2, dim = -1) #v, gate [500,600]
+            qk = self.to_qk(normed_x_qk) #qk [500,128]
+            # print('qk')
+            # print(qk)
+            #qk反量化
+            for batch in range(20):
+                qk_quant_matrix = torch.outer(normed_x_qk_row_scale[batch], qk_params)
+                qk[batch] = qk[batch] * qk_quant_matrix
 
+            q, k = self.offsetscale(qk) #q, k [500,128]
+            q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
 
-        q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
+            # quantize activation
+            q_row_max = torch.max(torch.abs(q), dim=2).values
+            k_row_max = torch.max(torch.abs(k), dim=2).values
+            q_row_scale = q_row_max / 127
+            k_row_scale = k_row_max / 127
+            for batch in range(20):
+                for i in range(500):
+                    q[batch,i,:] = q[batch,i,:] / q_row_scale[batch,i]
+                    k[batch,i,:] = k[batch,i,:] / k_row_scale[batch,i]
+            q = torch.clamp(q, min=-127, max=127)
+            k = torch.clamp(k, min=-127, max=127)
+            q = q.to(torch.int8)
+            k = k.to(torch.int8)
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
 
-        # quantize activation
-        q_row_max = torch.max(torch.abs(q), dim=2).values
-        k_row_max = torch.max(torch.abs(k), dim=2).values
-        q_row_scale = q_row_max / 127
-        k_row_scale = k_row_max / 127
-        for batch in range(20):
-            for i in range(500):
-                q[batch,i,:] = q[batch,i,:] / q_row_scale[batch,i]
-                k[batch,i,:] = k[batch,i,:] / k_row_scale[batch,i]
-        q = torch.clamp(q, min=-127, max=127)
-        k = torch.clamp(k, min=-127, max=127)
-        q = q.to(torch.int8)
-        k = k.to(torch.int8)
-        q = q.to(torch.float32)
-        k = k.to(torch.float32)
+            sim = einsum('b i d, b j d -> b i j', q, k)
+            sim = sim.to(torch.int32)
+            sim = sim.to(torch.float32)
 
-        sim = einsum('b i d, b j d -> b i j', q, k)
-        sim = sim + self.rel_pos_bias(sim)
-        attn = self.attn_fn(sim / seq_len)
-        attn = self.dropout(attn) #attn [500,500]
-        if exists(mask):
-            mask = rearrange(mask, 'b j -> b 1 j')
-            attn = attn.masked_fill(~mask, 0.)
-        if self.causal:
-            causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
-            attn = attn.masked_fill(causal_mask, 0.)
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = out * gate #out [500,600]
-        out_out = out / out_s.cuda()
+            # print('sim')
+            # print(sim)
 
-        out1 = self.to_out(out)
-        
-        if save_log:
-            out_origin = out1[0].cpu()
-            out_origin = out_origin.numpy()
-            np.savetxt('out_origin.txt', out_origin, fmt='%f')
+            #sim反量化
+            for batch in range(20):
+                sim_quant_matrix = torch.outer(q_row_scale[batch], k_row_scale[batch])
+                sim[batch] = sim[batch] * sim_quant_matrix
 
-        out = self.to_out(out_out) #out [500,300]
+            sim = sim + self.rel_pos_bias(sim)
+            attn = self.attn_fn(sim / seq_len)
+            attn = self.dropout(attn) #attn [500,500]
+            if exists(mask):
+                mask = rearrange(mask, 'b j -> b 1 j')
+                attn = attn.masked_fill(~mask, 0.)
+            if self.causal:
+                causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
+                attn = attn.masked_fill(causal_mask, 0.)
 
-        if save_log:
-            out_after = out[0].cpu()
-            out_after = out_after.numpy()
-            np.savetxt('out_after.txt', out_after, fmt='%f')    
+            #attn quantize
+            attn_row_max = torch.max(torch.abs(attn), dim=2).values
+            v_col_max = torch.max(torch.abs(v), dim=1).values
 
-        if self.add_residual:
-            out = out + x
+            attn_row_scale = attn_row_max / 127
+            v_col_scale = v_col_max / 127
 
-        return out
+            for batch in range(20):
+                for i in range(500):
+                    attn[batch,i,:] = attn[batch,i,:] / attn_row_scale[batch,i]
+                for i in range(600):
+                    v[batch,:,i] = v[batch,:,i] / v_col_scale[batch,i]
 
+            attn = torch.clamp(attn, min=-127, max=127)
+            v = torch.clamp(v, min=-127, max=127)
+            attn = attn.to(torch.int8)
+            v = v.to(torch.int8)
+            attn = attn.to(torch.float32)
+            v = v.to(torch.float32)
+
+            out = einsum('b i j, b j d -> b i d', attn, v)
+            out = out.to(torch.int32)
+            out = out.to(torch.float32)
+
+            #out反量化
+            for batch in range(20):
+                out_quant_matrix = torch.outer(attn_row_scale[batch], v_col_scale[batch])
+                out[batch] = out[batch] * out_quant_matrix
+
+            out = out * gate #out [500,600]
+            out = out / (out_s.view(1,-1).cuda())
+
+            #out重量化
+            out_row_max = torch.max(torch.abs(out), dim=2).values
+            out_row_scale = out_row_max / 127
+            for batch in range(20):
+                for i in range(500):
+                    out[batch,i,:] = out[batch,i,:] / out_row_scale[batch,i]
+            out = torch.clamp(out, min=-127, max=127)
+            out = out.to(torch.int8)
+            out = out.to(torch.float32)
+
+            out = self.to_out(out) #out [500,300]
+            #to_out反量化
+            for batch in range(20):
+                out_quant_matrix = torch.outer(out_row_scale[batch], out_params)
+                out[batch] = out[batch] * out_quant_matrix
+
+            if self.add_residual:
+                out = out + x
+            return out
 
 class Config(object):
     """配置参数"""
@@ -307,6 +364,7 @@ class Config(object):
         self.checkpoint_path = './model.ckpt'
         self.query_key_dim = 300
 
+#读取数据集相关
 torch.manual_seed(1234)
 
 class ImdbDataset(Dataset):
@@ -412,6 +470,7 @@ class Model(nn.Module):
         self.gaus = nn.ModuleList([
             copy.deepcopy(self.gau)
             for _ in range(config.num_gau)])
+
         self.fc1 = nn.Linear(config.pad_size * config.dim_model, config.num_classes)
 
     def forward(self, x):
@@ -422,95 +481,9 @@ class Model(nn.Module):
             out = gau(out,gau_scales[i],weight_quant_params[i])
             i = i + 1
         out = out.view(out.size(0), -1)
+        # out = torch.mean(out, 1)
         out = self.fc1(out)
         return out
-
-# 预先定义配置
-config = Config()
-train_data,test_data,vocabs_size = load_data(config)#加载数据
-config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
-model = Model(config)#调用transformer的编码器
-loaded_awq_0 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_0.pt')
-
-gau_scales[0][0] = loaded_awq_0['scale'][0][2]
-gau_scales[0][1] = loaded_awq_0['scale'][1][2]
-gau_scales[0][2] = loaded_awq_0['scale'][2][2]
-
-gau_clips[0][0] = loaded_awq_0['clip'][0][1]
-gau_clips[0][1] = loaded_awq_0['clip'][1][1]
-gau_clips[0][2] = loaded_awq_0['clip'][2][1]
-
-def modify_layer_weight_group(model,level):
-    weight_scale = gau_scales[level]
-    clip_hidden = gau_clips[level][0].cuda()
-    clip_qk = gau_clips[level][1].cuda()
-    clip_out = gau_clips[level][2].cuda()
-    layer = model.gaus[level]
-    layer_hidden_data = layer.to_hidden[0].weight.data
-    layer_qk_data = layer.to_qk[0].weight.data
-    layer_out_data = layer.to_out[0].weight.data
-    #modify scale
-    qk_s = weight_scale[0]
-    hidden_s = weight_scale[1]
-    out_s = weight_scale[2]
-
-    layer_hidden_data = layer_hidden_data * hidden_s.cuda()
-    layer_qk_data = layer_qk_data * qk_s.cuda()
-    layer_out_data = layer_out_data * out_s.cuda()
-
-    #modify to_hidden clip
-    for row in range(1200):
-        for group in range(3):
-            layer_hidden_data[row][group*100 : (group * 100 + 100)] = torch.clamp(layer_hidden_data[row][group*100 : (group * 100 + 100)], min= -clip_hidden[row][group], max=clip_hidden[row][group])
-    
-    #modify to_qk clip
-    for row in range(128):
-        for group in range(3):
-            layer_qk_data[row][group*100 : (group * 100 + 100)] = torch.clamp(layer_qk_data[row][group*100 : (group * 100 + 100)], min= -clip_qk[row][group], max=clip_qk[row][group])
-    
-    #modify to_out clip
-    for row in range(300):
-        for group in range(6):
-            layer_out_data[row][group*100 : (group * 100 + 100)] = torch.clamp(layer_out_data[row][group*100 : (group * 100 + 100)], min= -clip_out[row][group], max=clip_out[row][group])
-    
-    #quantize weight
-    for row in range(1200):
-        for group in range(3):
-            t = layer_hidden_data[row][group*100 : (group * 100 + 100)]
-            t_max = torch.max(abs(t))
-            t_quant_scale = t_max / 127
-            t = t / t_quant_scale
-            t = t.to(torch.int8)
-            t = t.to(torch.float32)
-            layer_hidden_data[row][group*100 : (group * 100 + 100)] = t
-            weight_quant_params[level][0][row][group] = t_quant_scale
-
-    for row in range(128):
-        for group in range(3):
-            t = layer_qk_data[row][group*100 : (group * 100 + 100)]
-            t_max = torch.max(abs(t))
-            t_quant_scale = t_max / 127
-            t = t / t_quant_scale
-            t = t.to(torch.int8)
-            t = t.to(torch.float32)
-            layer_qk_data[row][group*100 : (group * 100 + 100)] = t
-            weight_quant_params[level][1][row][group] = t_quant_scale
-
-    for row in range(300):
-        for group in range(6):
-            t = layer_out_data[row][group*100 : (group * 100 + 100)]
-            t_max = torch.max(abs(t))
-            t_quant_scale = t_max / 127
-            t = t / t_quant_scale
-            t = t.to(torch.int8)
-            t = t.to(torch.float32)
-            layer_out_data[row][group*100 : (group * 100 + 100)] = t
-            weight_quant_params[level][2][row][group] = t_quant_scale
-    
-    #save modified data
-    model.gaus[level].to_hidden[0].weight.data = layer_hidden_data
-    model.gaus[level].to_qk[0].weight.data = layer_qk_data
-    model.gaus[level].to_out[0].weight.data = layer_out_data
 
 def modify_layer_weight_channel(model,level):
     weight_scale = gau_scales[level]
@@ -518,9 +491,9 @@ def modify_layer_weight_channel(model,level):
     clip_qk = gau_clips[level][1].cuda()
     clip_out = gau_clips[level][2].cuda()
     layer = model.gaus[level]
-    layer_hidden_data = layer.to_hidden[0].weight.data
-    layer_qk_data = layer.to_qk[0].weight.data
-    layer_out_data = layer.to_out[0].weight.data
+    layer_hidden_data = layer.to_hidden[0].weight.data.cuda()
+    layer_qk_data = layer.to_qk[0].weight.data.cuda()
+    layer_out_data = layer.to_out[0].weight.data.cuda()
     #modify scale
     qk_s = weight_scale[0]
     hidden_s = weight_scale[1]
@@ -578,13 +551,64 @@ def modify_layer_weight_channel(model,level):
     model.gaus[level].to_qk[0].weight.data = layer_qk_data
     model.gaus[level].to_out[0].weight.data = layer_out_data
 
+
+loaded_awq_0 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_0.pt')
+loaded_awq_1 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_1.pt')
+loaded_awq_2 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_2.pt')
+loaded_awq_3 = torch.load('/root/gau/Gau_transformer/models_save/awq_results_3.pt')
+
+# gau_scales[0][0] = loaded_awq_0['scale'][0][2]
+# gau_scales[0][1] = loaded_awq_0['scale'][1][2]
+# gau_scales[0][2] = loaded_awq_0['scale'][2][2]
+
+gau_clips[0][0] = loaded_awq_0['clip'][0][1]
+gau_clips[0][1] = loaded_awq_0['clip'][1][1]
+gau_clips[0][2] = loaded_awq_0['clip'][2][1]
+
+# gau_scales[1][0] = loaded_awq_1['scale'][0][2]
+# gau_scales[1][1] = loaded_awq_1['scale'][1][2]
+# gau_scales[1][2] = loaded_awq_1['scale'][2][2]
+
+gau_clips[1][0] = loaded_awq_1['clip'][0][1]
+gau_clips[1][1] = loaded_awq_1['clip'][1][1]
+gau_clips[1][2] = loaded_awq_1['clip'][2][1]
+
+# gau_scales[2][0] = loaded_awq_2['scale'][0][2]
+# gau_scales[2][1] = loaded_awq_2['scale'][1][2]
+# gau_scales[2][2] = loaded_awq_2['scale'][2][2]
+
+gau_clips[2][0] = loaded_awq_2['clip'][0][1]
+gau_clips[2][1] = loaded_awq_2['clip'][1][1]
+gau_clips[2][2] = loaded_awq_2['clip'][2][1]
+
+# gau_scales[3][0] = loaded_awq_3['scale'][0][2]
+# gau_scales[3][1] = loaded_awq_3['scale'][1][2]
+# gau_scales[3][2] = loaded_awq_3['scale'][2][2]
+
+gau_clips[3][0] = loaded_awq_3['clip'][0][1]
+gau_clips[3][1] = loaded_awq_3['clip'][1][1]
+gau_clips[3][2] = loaded_awq_3['clip'][2][1]
+
+print('=========================')
+print(gau_scales[0][0])
+print(gau_clips[0][0])
+
+# 预先定义配置
+config = Config()
+train_data,test_data,vocabs_size = load_data(config)#加载数据
+config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
+model = Model(config)#调用transformer的编码器
+
 #load Model 
 stat_dict = torch.load('../models_save/gau_best.pt')
 model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 model.cuda()
 model.eval() # set the model to evaluation mode
 
-modify_layer_weight(model,0)
+modify_layer_weight_channel(model,0)
+modify_layer_weight_channel(model,1)
+modify_layer_weight_channel(model,2)
+modify_layer_weight_channel(model,3)
 
 optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
 criterion = nn.CrossEntropyLoss()#多分类的任务
@@ -593,21 +617,7 @@ batch_size=config.batch_size
 val_acc = 0.0
 val_loss = 0.0
 
-# print(loaded_awq_0['scale'][0][2].shape)
-# print(loaded_awq_0['scale'][0][2])
-
-# print(loaded_awq_0['scale'])
-# print(loaded_awq_0['clip'])
-# print('##########################')
-# print(loaded_awq_0['clip'][0][1].shape)
-# print(loaded_awq_0['clip'][1][1].shape)
-# print(loaded_awq_0['clip'][2][1].shape)
-# scale 0:to_qk 1:to_hidden 2:to_out
-# weight to_hidden: [1200,300] to_qk: [128,300] to_out: [300,600]
-# clip 0:to_hidden 1:to_qk 2:to_out
-# 0: [1200,3,1] 1:[128,3,1] 2:[300,6,1]
-
-end_point = 1250
+end_point = 125
 
 with torch.no_grad():
     for i, batch in enumerate(tqdm(test_data)):
@@ -616,6 +626,11 @@ with torch.no_grad():
         
         labels = labels.cuda()
         outputs = model(features)
+
+        # print('outputs')
+        # print(outputs)
+        # print('labels')
+        # print(labels)
 
         # output_origin = outputs[0].cpu()
         # output_origin = output_origin.numpy()
@@ -628,9 +643,6 @@ with torch.no_grad():
         # print(i)
         # print(val_acc)
         # print(val_loss)
-        if i == end_point:
-            break
+        # if i == end_point:
+        #     break
 print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
-
-
-        

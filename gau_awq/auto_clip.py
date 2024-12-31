@@ -63,6 +63,39 @@ def auto_clip_layer(
     return best_max_val.squeeze(1)
 
 
+# @torch.no_grad()
+# def auto_clip_block(module, w_bit, q_config, input_feat, scales_list):
+#     named_linears = {
+#         name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)
+#     }
+
+#     clip_list = []
+#     for name in named_linears:
+#         if 'to_hidden' in name:
+#             named_linears[name].cuda()
+#             max_val = auto_clip_layer(
+#                 named_linears[name].weight * scales_list[1][2].cuda() , input_feat[name], n_bit=w_bit, q_config=q_config
+#             )
+#             clip_list.append((name, max_val))
+#             named_linears[name].cpu()
+#         if 'to_qk' in name:
+#             named_linears[name].cuda()
+#             max_val = auto_clip_layer(
+#                 named_linears[name].weight * scales_list[0][2].cuda(), input_feat[name], n_bit=w_bit, q_config=q_config
+#             )
+#             clip_list.append((name, max_val))
+#             named_linears[name].cpu()
+#         if 'to_out' in name:
+#             named_linears[name].cuda()
+#             max_val = auto_clip_layer(
+#                 named_linears[name].weight * scales_list[2][2].cuda(), input_feat[name], n_bit=w_bit, q_config=q_config
+#             )
+#             clip_list.append((name, max_val))
+#             named_linears[name].cpu()
+        
+#     return clip_list
+
+
 @torch.no_grad()
 def auto_clip_block(module, w_bit, q_config, input_feat):
     named_linears = {
@@ -78,7 +111,6 @@ def auto_clip_block(module, w_bit, q_config, input_feat):
         clip_list.append((name, max_val))
         named_linears[name].cpu()
     return clip_list
-
 
 @torch.no_grad()
 def apply_clip(module, clip_list):

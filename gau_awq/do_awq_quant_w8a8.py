@@ -35,7 +35,7 @@ from rotary_embedding_torch import RotaryEmbedding
 from .pre_quant import run_awq, apply_awq
 from .quantizer import (
     pseudo_quantize_model_weight,
-    real_quantize_model_weight,
+    # real_quantize_model_weight,
 )
 
 from .auto_scale import auto_scale_block, apply_scale
@@ -240,8 +240,8 @@ class Config(object):
         self.checkpoint_path = '../model.ckpt'
         self.query_key_dim = 300
         self.load_quant = False
-        self.no_zero_point = False
-        self.q_group_size = 100
+        self.no_zero_point = True
+        self.q_group_size = 300
         self.w_bit = 8
         self.run_awq = True
         self.dump_awq = '/root/gau/Gau_transformer/models_save/gau_best_awq_data'
@@ -314,8 +314,26 @@ def get_blocks(model):
     layers = model.gaus
     return layers
 
-def get_scale_and_clip(model,layers,inps,level):    
 
+# def modify_layer_scale(model,scales_list):
+#     weight_scale = gau_scales[level]
+#     clip_hidden = gau_clips[level][0].cuda()
+#     clip_qk = gau_clips[level][1].cuda()
+#     clip_out = gau_clips[level][2].cuda()
+#     layer = model.gaus[level]
+#     layer_hidden_data = layer.to_hidden[0].weight.data.cuda()
+#     layer_qk_data = layer.to_qk[0].weight.data.cuda()
+#     layer_out_data = layer.to_out[0].weight.data.cuda()
+#     #modify scale
+#     qk_s = weight_scale[0]
+#     hidden_s = weight_scale[1]
+#     out_s = weight_scale[2]
+
+#     layer_hidden_data = layer_hidden_data * hidden_s.cuda()
+#     layer_qk_data = layer_qk_data * qk_s.cuda()
+#     layer_out_data = layer_out_data * out_s.cuda()
+
+def get_scale_and_clip(model,layers,inps,level):    
     awq_results = {
         "scale": [],
         "clip": [],
@@ -354,6 +372,10 @@ def get_scale_and_clip(model,layers,inps,level):
         q_config=q_config,
         input_feat=input_feat,
     )
+
+    # print('!!!!!!!!!!!!!!!!!!!!!')
+    # print(scales_list)
+
     awq_results["scale"] += append_str_prefix(
         scales_list, get_op_name(model, layer) + "."
     )
@@ -363,7 +385,8 @@ def get_scale_and_clip(model,layers,inps,level):
         layer,
         w_bit=8,
         q_config=q_config,
-        input_feat=input_feat,
+        input_feat=input_feat
+        #scales_list=scales_list
     )
     apply_clip(layer, clip_list)
     # append prefix to make names global
@@ -420,6 +443,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
     awq_results_0 = get_scale_and_clip(model,layers,inps,0)
+
     awq_results_1 = get_scale_and_clip(model,layers,inps,1)
     awq_results_2 = get_scale_and_clip(model,layers,inps,2)
     awq_results_3 = get_scale_and_clip(model,layers,inps,3)

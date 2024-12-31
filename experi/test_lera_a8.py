@@ -125,6 +125,9 @@ for i in range(500) :
             my_mask2[i,j] = 1 << 8
 my_mask2 = my_mask2.unsqueeze(0).expand(20, -1, -1)
 
+all_thresh1 = []
+all_thresh2 = []
+
 class GAU(nn.Module):
     def __init__(
         self,
@@ -195,6 +198,9 @@ class GAU(nn.Module):
                 if count > (300000 * 0.3):
                     trim_thresh = threshold
                     break
+            print('thresh1')
+            print(threshold)
+            all_thresh1.append(threshold)
             #print("trim_thresh ",trim_thresh)
             counts = np.zeros((100, 120))
             for i in range(100):
@@ -213,6 +219,9 @@ class GAU(nn.Module):
                     #print("thresh2 c ",c)
                     break
             #print("thresh2 ",thresh2)
+            print('thresh2')
+            print(thresh2)
+            all_thresh2.append(thresh2)
             gate_mask = np.zeros((500, 600))
             gate_mask2 = np.zeros((500, 600))
             for i in range(100):
@@ -378,7 +387,6 @@ class GAU(nn.Module):
         #attn,out quantize
         attn_row_max = torch.max(torch.abs(attn), dim=2).values
         v_col_max = torch.max(torch.abs(v), dim=1).values
-        #print("v_col_max",v_col_max.shape)
 
         attn_row_scale = attn_row_max / 127
         v_col_scale = v_col_max / 127

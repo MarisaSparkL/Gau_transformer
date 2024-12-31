@@ -113,6 +113,19 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
+
+weight_quant_params = [
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)],
+    [torch.ones(1200),torch.ones(128),torch.ones(300)]
+]
+
 class GAU(nn.Module):
     def __init__(
         self,
@@ -127,31 +140,24 @@ class GAU(nn.Module):
     ):
         super().__init__()
         hidden_dim = int(expansion_factor * dim)
-
         self.norm = norm_klass(dim)
         self.causal = causal
         self.dropout = nn.Dropout(dropout)
         self.query_key_dim = query_key_dim
-
         self.attn_fn = ReLUSquared() 
-
         self.to_hidden = nn.Sequential(
             nn.Linear(dim, hidden_dim * 2),
             nn.SiLU()
         )
-
         self.to_qk = nn.Sequential(
             nn.Linear(dim, query_key_dim),
             nn.SiLU()
         )
-
         self.offsetscale = OffsetScale(query_key_dim, heads = 2)
-
         self.to_out = nn.Sequential(
             nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
-
         self.add_residual = add_residual
         self.rotary_pos_emb = RotaryEmbedding(dim = min(32, self.query_key_dim))
         self.rel_pos_bias = T5RelativePositionBias(query_key_dim ** 0.5, causal = causal)
@@ -159,47 +165,165 @@ class GAU(nn.Module):
     def forward(
         self,
         x,
+        weight_scale,
+        quant_params,
         mask = None
     ):
+        hidden_params = quant_params[0].cuda()
+        qk_params = quant_params[1].cuda()
+        out_params = quant_params[2].cuda()
+
+        qk_s = weight_scale[0]
+        hidden_s = weight_scale[1]
+        out_s = weight_scale[2]
+
         seq_len, device = x.shape[-2], x.device
-
         normed_x = self.norm(x)
-
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+
+        normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
+        normed_x_qk = normed_x / (qk_s.view(1,-1).cuda())
+        normed_x_hidden = normed_x / (hidden_s.view(1,-1).cuda())
 
-        v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
+        #quantize_normed_x
+        normed_x_row_max = torch.max(torch.abs(normed_x), dim=2).values
+        normed_x_row_scale = normed_x_row_max / 127
+        for batch in range(20):
+            for i in range(500):
+                normed_x[batch,i,:] = normed_x[batch,i,:] / normed_x_row_scale[batch,i]
+        normed_x = torch.clamp(normed_x, min=-127, max=127)
+        normed_x = normed_x.to(torch.int8)
+        normed_x = normed_x.to(torch.float32)
 
+        #quantize_normed_x_qk
+        normed_x_qk_row_max = torch.max(torch.abs(normed_x_qk), dim=2).values
+        normed_x_qk_row_scale = normed_x_qk_row_max / 127
+        for batch in range(20):
+            for i in range(500):
+                normed_x_qk[batch,i,:] = normed_x_qk[batch,i,:] / normed_x_qk_row_scale[batch,i]
+        normed_x_qk = torch.clamp(normed_x_qk, min=-127, max=127)
+        normed_x_qk = normed_x_qk.to(torch.int8)
+        normed_x_qk = normed_x_qk.to(torch.float32)
+
+        #quantize_normed_x_hidden
+        normed_x_hidden_row_max = torch.max(torch.abs(normed_x_hidden), dim=2).values
+        normed_x_hidden_row_scale = normed_x_hidden_row_max / 127
+        for batch in range(20):
+            for i in range(500):
+                normed_x_hidden[batch,i,:] = normed_x_hidden[batch,i,:] / normed_x_hidden_row_scale[batch,i]
+        normed_x_hidden = torch.clamp(normed_x_hidden, min=-127, max=127)
+        normed_x_hidden = normed_x_hidden.to(torch.int8)
+        normed_x_hidden = normed_x_hidden.to(torch.float32)
+
+        # v_gate = self.to_hidden(normed_x_hidden)
+        v_gate = self.to_hidden(normed_x)
+        #v_gate反量化
+        for batch in range(20):
+            v_gate_quant_matrix = torch.outer(normed_x_hidden_row_scale[batch], hidden_params)
+            # v_gate_quant_matrix = torch.outer(normed_x_row_scale[batch], hidden_params)
+            v_gate[batch] = v_gate[batch] * v_gate_quant_matrix
+
+        v, gate = v_gate.chunk(2, dim = -1) #v, gate [500,600]
+        # qk = self.to_qk(normed_x_qk) #qk [500,128]
         qk = self.to_qk(normed_x) #qk [500,128]
-        q, k = self.offsetscale(qk) #q, k [500,128]
+        #qk反量化
+        for batch in range(20):
+            # qk_quant_matrix = torch.outer(normed_x_row_scale[batch], qk_params)
+            qk_quant_matrix = torch.outer(normed_x_qk_row_scale[batch], qk_params)
+            qk[batch] = qk[batch] * qk_quant_matrix
 
+        q, k = self.offsetscale(qk) #q, k [500,128]
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
 
-        sim = einsum('b i d, b j d -> b i j', q, k)
-        sim = sim + self.rel_pos_bias(sim)
+        # quantize activation
+        q_row_max = torch.max(torch.abs(q), dim=2).values
+        k_row_max = torch.max(torch.abs(k), dim=2).values
+        q_row_scale = q_row_max / 127
+        k_row_scale = k_row_max / 127
+        for batch in range(20):
+            for i in range(500):
+                q[batch,i,:] = q[batch,i,:] / q_row_scale[batch,i]
+                k[batch,i,:] = k[batch,i,:] / k_row_scale[batch,i]
+        q = torch.clamp(q, min=-127, max=127)
+        k = torch.clamp(k, min=-127, max=127)
+        q = q.to(torch.int8)
+        k = k.to(torch.int8)
+        q = q.to(torch.float32)
+        k = k.to(torch.float32)
 
+        sim = einsum('b i d, b j d -> b i j', q, k)
+        sim = sim.to(torch.int32)
+        sim = sim.to(torch.float32)
+
+        #sim反量化
+        for batch in range(20):
+            sim_quant_matrix = torch.outer(q_row_scale[batch], k_row_scale[batch])
+            sim[batch] = sim[batch] * sim_quant_matrix
+
+        sim = sim + self.rel_pos_bias(sim)
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
-
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
             attn = attn.masked_fill(~mask, 0.)
-
         if self.causal:
             causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
 
+        #attn quantize
+        attn_row_max = torch.max(torch.abs(attn), dim=2).values
+        v_col_max = torch.max(torch.abs(v), dim=1).values
+
+        attn_row_scale = attn_row_max / 127
+        v_col_scale = v_col_max / 127
+
+        for batch in range(20):
+            for i in range(500):
+                attn[batch,i,:] = attn[batch,i,:] / attn_row_scale[batch,i]
+            for i in range(600):
+                v[batch,:,i] = v[batch,:,i] / v_col_scale[batch,i]
+
+        attn = torch.clamp(attn, min=-127, max=127)
+        v = torch.clamp(v, min=-127, max=127)
+        attn = attn.to(torch.int8)
+        v = v.to(torch.int8)
+        attn = attn.to(torch.float32)
+        v = v.to(torch.float32)
+
         out = einsum('b i j, b j d -> b i d', attn, v)
+        out = out.to(torch.int32)
+        out = out.to(torch.float32)
+
+        #out反量化
+        for batch in range(20):
+            out_quant_matrix = torch.outer(attn_row_scale[batch], v_col_scale[batch])
+            out[batch] = out[batch] * out_quant_matrix
+
         out = out * gate #out [500,600]
 
+        out = out / (out_s.view(1,-1).cuda())
+        #out重量化
+        out_row_max = torch.max(torch.abs(out), dim=2).values
+        out_row_scale = out_row_max / 127
+        for batch in range(20):
+            for i in range(500):
+                out[batch,i,:] = out[batch,i,:] / out_row_scale[batch,i]
+        out = torch.clamp(out, min=-127, max=127)
+        out = out.to(torch.int8)
+        out = out.to(torch.float32)
+
         out = self.to_out(out) #out [500,300]
+        #to_out反量化
+        for batch in range(20):
+            out_quant_matrix = torch.outer(out_row_scale[batch], out_params)
+            out[batch] = out[batch] * out_quant_matrix
 
         if self.add_residual:
             out = out + x
 
         return out
-
 
 
 class Config(object):
@@ -227,7 +351,7 @@ torch.manual_seed(1234)
 
 class ImdbDataset(Dataset):
     def __init__(
-        self, folder_path="./aclImdb", is_train=True, is_small=False
+        self, folder_path="../aclImdb", is_train=True, is_small=False
     ) -> None:
         super().__init__()
         self.data, self.labels = self.read_dataset(folder_path, is_train, is_small)
@@ -249,9 +373,6 @@ class ImdbDataset(Dataset):
                     text = f.read().decode("utf-8").replace("\n", "").lower()
                     data.append(text)
                     labels.append(1 if label == "pos" else 0)
-        # random.shuffle(data)
-        # random.shuffle(labels)
-        # 小样本训练，仅用于本机验证
         
         return data, labels
     def __len__(self):
@@ -266,7 +387,6 @@ class ImdbDataset(Dataset):
     def get_labels(self):
         return self.labels
 
-
 def get_tokenized(data):
     """获取数据集的词元列表"""
 
@@ -274,7 +394,6 @@ def get_tokenized(data):
         return [tok.lower() for tok in text.split(" ")]
 
     return [tokenizer(review) for review in data]
-
 
 def get_vocab(data):
     """获取数据集的词汇表"""
@@ -287,9 +406,7 @@ def get_vocab(data):
         if freq >= 5:
             vocab_freq[word] = len(vocab_freq)
 
-    # 构建词汇表对象并返回
     return vocab(vocab_freq)
-
 
 def preprocess_imdb(train_data, vocab,config):
     """数据预处理，将数据转换成神经网络的输入形式"""
@@ -309,19 +426,14 @@ def preprocess_imdb(train_data, vocab,config):
 
 def load_data(config):
     """加载数据集"""
-    train_data = ImdbDataset(folder_path="./aclImdb", is_train=True)
-    test_data = ImdbDataset(folder_path="./aclImdb", is_train=False)
-    # print("输出第一句话：")
-    # print(train_data.__getitem__(1))
+    train_data = ImdbDataset(folder_path="../aclImdb", is_train=True)
+    test_data = ImdbDataset(folder_path="../aclImdb", is_train=False)
+
     vocab = get_vocab(train_data.get_data())
     train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-    # print("输出第一句话字典编码表示以及序列长度：")
-    # print(train_set.__getitem__(1),train_set.__getitem__(1)[0].shape)
        
     test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-    # print(f"训练集大小{train_set.__len__()}")
-    # print(f"测试集大小{test_set.__len__()}")
-    # print(f"词表中单词个数:{len(vocab)}")
+
     train_iter = DataLoader(
         train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
     )
@@ -340,16 +452,16 @@ class Model(nn.Module):
         self.gaus = nn.ModuleList([
             copy.deepcopy(self.gau)
             for _ in range(config.num_gau)])
-
         self.fc1 = nn.Linear(config.pad_size * config.dim_model, config.num_classes)
 
     def forward(self, x):
         out = self.embedding(x)
         out = self.postion_embedding(out)
+        i = 0
         for gau in self.gaus:
-            out = gau(out)
+            out = gau(out,gau_scales[i],weight_quant_params[i])
+            i = i + 1
         out = out.view(out.size(0), -1)
-        # out = torch.mean(out, 1)
         out = self.fc1(out)
         return out
 
@@ -358,70 +470,95 @@ config = Config()
 train_data,test_data,vocabs_size = load_data(config)#加载数据
 config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
 model = Model(config)#调用transformer的编码器
+
+def modify_layer_weight_channel(model,level):
+    layer = model.gaus[level]
+    layer_hidden_data = layer.to_hidden[0].weight.data
+    layer_qk_data = layer.to_qk[0].weight.data
+    layer_out_data = layer.to_out[0].weight.data
+    
+    #quantize weight
+    for row in range(1200):
+        t = layer_hidden_data[row]
+        t_max = torch.max(abs(t))
+        t_quant_scale = t_max / 127
+        t = t / t_quant_scale
+        t = t.to(torch.int8)
+        t = t.to(torch.float32)
+        layer_hidden_data[row] = t
+        weight_quant_params[level][0][row] = t_quant_scale
+
+    for row in range(128):
+        t = layer_qk_data[row]
+        t_max = torch.max(abs(t))
+        t_quant_scale = t_max / 127
+        t = t / t_quant_scale
+        t = t.to(torch.int8)
+        t = t.to(torch.float32)
+        layer_qk_data[row] = t
+        weight_quant_params[level][1][row] = t_quant_scale
+
+    for row in range(300):
+        t = layer_out_data[row]
+        t_max = torch.max(abs(t))
+        t_quant_scale = t_max / 127
+        t = t / t_quant_scale
+        t = t.to(torch.int8)
+        t = t.to(torch.float32)
+        layer_out_data[row] = t
+        weight_quant_params[level][2][row] = t_quant_scale
+    
+    #save modified data
+    model.gaus[level].to_hidden[0].weight.data = layer_hidden_data
+    model.gaus[level].to_qk[0].weight.data = layer_qk_data
+    model.gaus[level].to_out[0].weight.data = layer_out_data
+
+#load Model 
+stat_dict = torch.load('../models_save/gau_best.pt')
+model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 model.cuda()
+model.eval() # set the model to evaluation mode
+
+modify_layer_weight_channel(model,0)
+modify_layer_weight_channel(model,1)
+modify_layer_weight_channel(model,2)
+modify_layer_weight_channel(model,3)
+
 optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
 criterion = nn.CrossEntropyLoss()#多分类的任务
 batch_size=config.batch_size
 
-#记录模型参数量
-params = list(model.parameters())
-k = 0
-for i in params:
-    l = 1
-    print("该层的结构：" + str(list(i.size())))
-    for j in i.size():
-        l *= j
-    print("该层参数和：" + str(l))
-    k = k + l
-print("总参数数量和：" + str(k))
+val_acc = 0.0
+val_loss = 0.0
 
-# 记录训练过程的数据
-epoch_loss_values = []
-metric_values = []
-best_acc = 0.0
-for epoch in range(config.num_epochs):
-    train_acc = 0.0
-    train_loss = 0.0
-    val_acc = 0.0
-    val_loss = 0.0
-    # training
-    model.train()
-    for i,train_idx in enumerate(tqdm(train_data)):
-        features, labels = train_idx
+end_point = 50
+
+with torch.no_grad():
+    for i, batch in enumerate(tqdm(test_data)):
+        features, labels = batch
         features = features.cuda()
+        
         labels = labels.cuda()
-        
-        optimizer.zero_grad() 
-        outputs = model(features) 
-        
-        loss = criterion(outputs, labels)
-        loss.backward() 
-        optimizer.step() 
-        
-        _, train_pred = torch.max(outputs, 1) # get the index of the class with the highest probability
-        train_acc += (train_pred.detach() == labels.detach()).sum().item()
-        train_loss += loss.item()
-    model.eval() # set the model to evaluation mode
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_data)):
-            features, labels = batch
-            features = features.cuda()
-            labels = labels.cuda()
-            outputs = model(features)
+        outputs = model(features)
 
-            loss = criterion(outputs, labels) 
-            
-            _, val_pred = torch.max(outputs, 1) 
-            val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
-            val_loss += loss.item()
-    print(f'训练信息：[{epoch+1:03d}/{config.num_epochs:03d}] Train Acc: {train_acc/25000:3.5f} Loss: {train_loss/len(train_data):3.5f} | Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
-    epoch_loss_values.append(train_loss/len(train_data))
-    metric_values.append(val_acc/25000)
-    if val_acc > best_acc:
-        best_acc = val_acc
-        torch.save(model.state_dict(), config.checkpoint_path)
-        print(f'saving model with acc {best_acc/25000:.5f}')
-    print(f'best model with acc {best_acc/25000:.5f}') 
+        # output_origin = outputs[0].cpu()
+        # output_origin = output_origin.numpy()
+        # np.savetxt('output_after.txt', output_origin, fmt='%f')
+        loss = criterion(outputs, labels)
+        print('outputs')
+        print(outputs)
+        print('labels')
+        print(labels)
         
-torch.save(model.state_dict(), 'model_gau.pt')   
+        _, val_pred = torch.max(outputs, 1) 
+        val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
+        val_loss += loss.item()
+        print(i)
+        print(val_acc)
+        print(val_loss)
+        # if i == end_point:
+        #     break
+print(f'Val Acc: {val_acc/300:3.5f} loss: {val_loss/len(test_data):3.5f}')
+
+
         

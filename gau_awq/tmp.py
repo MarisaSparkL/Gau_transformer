@@ -1,3 +1,10 @@
+import torch
+import torch.nn as nn
+import tqdm
+import gc
+import functools
+from collections import defaultdict
+from typing import List
 #---------------------------------------------------
 import pandas as pd
 from collections import Counter
@@ -6,19 +13,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch
-from    torch import autograd, einsum
+from torch import autograd, einsum
 import os
-from tqdm import tqdm
 import copy
 from einops import rearrange
-
 import collections
 import torchtext
 import random
 from torchtext.vocab import vocab, GloVe
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch import device
-
 import numpy as np
 from torch import nn, optim
 import torch.nn.functional as F
@@ -28,7 +32,16 @@ import time
 from torch.autograd import Variable
 from rotary_embedding_torch import RotaryEmbedding
 
+from .pre_quant import run_awq, apply_awq
+from .quantizer import (
+    pseudo_quantize_model_weight,
+    # real_quantize_model_weight,
+)
 
+from .auto_scale import auto_scale_block, apply_scale
+from .auto_clip import auto_clip_block, apply_clip
+
+#GAU定义相关
 def exists(val):
     return val is not None
 
@@ -113,6 +126,12 @@ class T5RelativePositionBias(nn.Module):
         bias = rearrange(values, 'i j 1 -> i j')
         return bias * self.scale
 
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
+
 class GAU(nn.Module):
     def __init__(
         self,
@@ -159,48 +178,46 @@ class GAU(nn.Module):
     def forward(
         self,
         x,
+        weight_scale,
         mask = None
     ):
         seq_len, device = x.shape[-2], x.device
-
         normed_x = self.norm(x)
-
+        #do token shifts
         x_shift, x_pass = normed_x.chunk(2, dim = -1)
         x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+        qk_s = weight_scale[0]
+        hidden_s = weight_scale[1]
+        out_s = weight_scale[2]
+        # qk_s.cuda()
+        # hidden_s.cuda()
+        # out_s.cuda()
+        normed_x.cuda()
         normed_x = torch.cat((x_shift, x_pass), dim = -1)
+        normed_x_qk = normed_x.div_(qk_s.view(1,-1).cuda())
+        normed_x_hidden = normed_x.div_(hidden_s.view(1,-1).cuda())
 
         v, gate = self.to_hidden(normed_x).chunk(2, dim = -1) #v, gate [500,600]
-
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
-
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
-
         sim = einsum('b i d, b j d -> b i j', q, k)
         sim = sim + self.rel_pos_bias(sim)
-
         attn = self.attn_fn(sim / seq_len)
         attn = self.dropout(attn) #attn [500,500]
-
         if exists(mask):
             mask = rearrange(mask, 'b j -> b 1 j')
             attn = attn.masked_fill(~mask, 0.)
-
         if self.causal:
             causal_mask = torch.ones((seq_len, seq_len), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = out * gate #out [500,600]
-
+        out_out = out.div_(out_s.view(1,-1).cuda())
         out = self.to_out(out) #out [500,300]
-
         if self.add_residual:
             out = out + x
-
         return out
-
-
 
 class Config(object):
     """配置参数"""
@@ -220,113 +237,26 @@ class Config(object):
         self.hidden = 1024
         self.last_hidden = 512
         self.num_gau = 4
-        self.checkpoint_path = './model.ckpt'
+        self.checkpoint_path = '../model.ckpt'
         self.query_key_dim = 300
+        self.load_quant = False
+        self.no_zero_point = True
+        self.q_group_size = 300
+        self.w_bit = 8
+        self.run_awq = True
+        self.dump_awq = '/root/gau/Gau_transformer/models_save/gau_best_awq_data'
+        self.load_awq = '/root/gau/Gau_transformer/models_save/gau_best_awq.pt'
+        self.model_path = '/root/gau/Gau_transformer/models_save/gau_best.pt'
 
+#读取数据集相关
 torch.manual_seed(1234)
 
-class ImdbDataset(Dataset):
-    def __init__(
-        self, folder_path="./aclImdb", is_train=True, is_small=False
-    ) -> None:
-        super().__init__()
-        self.data, self.labels = self.read_dataset(folder_path, is_train, is_small)
-
-    # 读取数据
-    def read_dataset(
-        self,
-        folder_path,
-        is_train,
-        small
-    ):
-        data, labels = [], []
-        for label in ("pos", "neg"):
-            folder_name = os.path.join(
-                folder_path, "train" if is_train else "test", label
-            )
-            for file in tqdm(os.listdir(folder_name)):
-                with open(os.path.join(folder_name, file), "rb") as f:
-                    text = f.read().decode("utf-8").replace("\n", "").lower()
-                    data.append(text)
-                    labels.append(1 if label == "pos" else 0)
-        # random.shuffle(data)
-        # random.shuffle(labels)
-        # 小样本训练，仅用于本机验证
-        
-        return data, labels
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        return self.data[index], int(self.labels[index])
-
-    def get_data(self):
-        return self.data
-
-    def get_labels(self):
-        return self.labels
-
-
-def get_tokenized(data):
-    """获取数据集的词元列表"""
-
-    def tokenizer(text):
-        return [tok.lower() for tok in text.split(" ")]
-
-    return [tokenizer(review) for review in data]
-
-
-def get_vocab(data):
-    """获取数据集的词汇表"""
-    tokenized_data = get_tokenized(data)
-    counter = collections.Counter([tk for st in tokenized_data for tk in st])
-    # 将min_freq设置为5，确保仅包括至少出现5次的单词
-    vocab_freq = {"<UNK>": 0, "<PAD>": 1}
-    # 添加满足词频条件的单词到词汇表，并分配索引
-    for word, freq in counter.items():
-        if freq >= 5:
-            vocab_freq[word] = len(vocab_freq)
-
-    # 构建词汇表对象并返回
-    return vocab(vocab_freq)
-
-
-def preprocess_imdb(train_data, vocab,config):
-    """数据预处理，将数据转换成神经网络的输入形式"""
-    max_l = config.pad_size  # 将每条评论通过截断或者补0，使得长度变成500
-
-    def pad(x):
-        return x[:max_l] if len(x) > max_l else x + [1] * (max_l - len(x))
-
-    labels = train_data.get_labels()
-    tokenized_data = get_tokenized(train_data.get_data())
-    vocab_dict = vocab.get_stoi()
-    features = torch.tensor(
-        [pad([vocab_dict.get(word, 0) for word in words]) for words in tokenized_data]
-    )
-    labels = torch.tensor([label for label in labels])
-    return features, labels
-
-def load_data(config):
-    """加载数据集"""
-    train_data = ImdbDataset(folder_path="./aclImdb", is_train=True)
-    test_data = ImdbDataset(folder_path="./aclImdb", is_train=False)
-    # print("输出第一句话：")
-    # print(train_data.__getitem__(1))
-    vocab = get_vocab(train_data.get_data())
-    train_set = TensorDataset(*preprocess_imdb(train_data, vocab,config))
-    # print("输出第一句话字典编码表示以及序列长度：")
-    # print(train_set.__getitem__(1),train_set.__getitem__(1)[0].shape)
-       
-    test_set = TensorDataset(*preprocess_imdb(test_data, vocab,config))
-    # print(f"训练集大小{train_set.__len__()}")
-    # print(f"测试集大小{test_set.__len__()}")
-    # print(f"词表中单词个数:{len(vocab)}")
-    train_iter = DataLoader(
-        train_set, batch_size=config.batch_size, shuffle=True, num_workers=0
-    )
-    test_iter = DataLoader(test_set, config.batch_size)
-    return train_iter, test_iter, vocab
+gau_scales = [[torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)],
+            [torch.ones(300),torch.ones(300),torch.ones(600)]
+            ]
+# gau_scales.cuda()
 
 class Model(nn.Module):
     def __init__(self, config):
@@ -346,8 +276,10 @@ class Model(nn.Module):
     def forward(self, x):
         out = self.embedding(x)
         out = self.postion_embedding(out)
+        i = 0
         for gau in self.gaus:
-            out = gau(out)
+            out = gau(out,gau_scales[i])
+            i = i + 1
         out = out.view(out.size(0), -1)
         # out = torch.mean(out, 1)
         out = self.fc1(out)
@@ -355,73 +287,174 @@ class Model(nn.Module):
 
 # 预先定义配置
 config = Config()
-train_data,test_data,vocabs_size = load_data(config)#加载数据
-config.n_vocab = len(vocabs_size) + 1#补充词表大小，词表一定要多留出来一个
+
+# train_data,test_data,vocabs_size = load_data(config)#加载数据
+# config.n_vocab = len(vocabs_size) + 1 #补充词表大小，词表一定要多留出来一个
+config.n_vocab = 46152
+
 model = Model(config)#调用transformer的编码器
-model.cuda()
-optimizer = torch.optim.Adam(model.parameters(),lr=config.learning_rate)
-criterion = nn.CrossEntropyLoss()#多分类的任务
-batch_size=config.batch_size
 
-#记录模型参数量
-params = list(model.parameters())
-k = 0
-for i in params:
-    l = 1
-    print("该层的结构：" + str(list(i.size())))
-    for j in i.size():
-        l *= j
-    print("该层参数和：" + str(l))
-    k = k + l
-print("总参数数量和：" + str(k))
+#load Model 
+stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
+model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
 
-# 记录训练过程的数据
-epoch_loss_values = []
-metric_values = []
-best_acc = 0.0
-for epoch in range(config.num_epochs):
-    train_acc = 0.0
-    train_loss = 0.0
-    val_acc = 0.0
-    val_loss = 0.0
-    # training
-    model.train()
-    for i,train_idx in enumerate(tqdm(train_data)):
-        features, labels = train_idx
-        features = features.cuda()
-        labels = labels.cuda()
-        
-        optimizer.zero_grad() 
-        outputs = model(features) 
-        
-        loss = criterion(outputs, labels)
-        loss.backward() 
-        optimizer.step() 
-        
-        _, train_pred = torch.max(outputs, 1) # get the index of the class with the highest probability
-        train_acc += (train_pred.detach() == labels.detach()).sum().item()
-        train_loss += loss.item()
-    model.eval() # set the model to evaluation mode
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_data)):
-            features, labels = batch
-            features = features.cuda()
-            labels = labels.cuda()
-            outputs = model(features)
+q_config = {
+    "zero_point": not config.no_zero_point,  # by default True
+    "q_group_size": config.q_group_size,  # whether to use group quantization
+}
 
-            loss = criterion(outputs, labels) 
-            
-            _, val_pred = torch.max(outputs, 1) 
-            val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
-            val_loss += loss.item()
-    print(f'训练信息：[{epoch+1:03d}/{config.num_epochs:03d}] Train Acc: {train_acc/25000:3.5f} Loss: {train_loss/len(train_data):3.5f} | Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
-    epoch_loss_values.append(train_loss/len(train_data))
-    metric_values.append(val_acc/25000)
-    if val_acc > best_acc:
-        best_acc = val_acc
-        torch.save(model.state_dict(), config.checkpoint_path)
-        print(f'saving model with acc {best_acc/25000:.5f}')
-    print(f'best model with acc {best_acc/25000:.5f}') 
-        
-torch.save(model.state_dict(), 'model_gau.pt')   
-        
+from .awq_utils import get_calib_dataset
+from .awq_utils import get_op_name
+from .awq_utils import append_str_prefix
+
+def get_named_linears(module):
+    return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
+
+def get_blocks(model):
+    layers = model.gaus
+    return layers
+
+
+# def modify_layer_scale(model,scales_list):
+#     weight_scale = gau_scales[level]
+#     clip_hidden = gau_clips[level][0].cuda()
+#     clip_qk = gau_clips[level][1].cuda()
+#     clip_out = gau_clips[level][2].cuda()
+#     layer = model.gaus[level]
+#     layer_hidden_data = layer.to_hidden[0].weight.data.cuda()
+#     layer_qk_data = layer.to_qk[0].weight.data.cuda()
+#     layer_out_data = layer.to_out[0].weight.data.cuda()
+#     #modify scale
+#     qk_s = weight_scale[0]
+#     hidden_s = weight_scale[1]
+#     out_s = weight_scale[2]
+
+#     layer_hidden_data = layer_hidden_data * hidden_s.cuda()
+#     layer_qk_data = layer_qk_data * qk_s.cuda()
+#     layer_out_data = layer_out_data * out_s.cuda()
+
+def get_scale_and_clip(model,layers,inps,level):    
+    awq_results = {
+        "scale": [],
+        "clip": [],
+    }
+
+    torch.cuda.empty_cache()
+    layer = layers[level]
+    layer = layer.cuda()
+    named_linears = get_named_linears(layer)
+
+    # firstly, get input features of all linear layers
+    def cache_input_hook(m, x, y, name, feat_dict):
+        x = x[0]
+        x = x.detach().cpu()
+        feat_dict[name].append(x)
+
+    input_feat = defaultdict(list)
+    handles = []
+    for name in named_linears:
+        handles.append(
+            named_linears[name].register_forward_hook(
+                functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
+            )
+        )
+    gc.collect()
+    torch.cuda.empty_cache()
+    inps = layer(inps,gau_scales[level])
+    for h in handles:
+        h.remove()
+    # now solve for scaling and clipping
+    input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
+    torch.cuda.empty_cache()
+    scales_list = auto_scale_block(
+        layer,
+        w_bit=8,
+        q_config=q_config,
+        input_feat=input_feat,
+    )
+
+    print('!!!!!!!!!!!!!!!!!!!!!')
+    print(scales_list)
+
+    awq_results["scale"] += append_str_prefix(
+        scales_list, get_op_name(model, layer) + "."
+    )
+    # Clear GPU memory
+    torch.cuda.empty_cache()
+    clip_list = auto_clip_block(
+        layer,
+        w_bit=8,
+        q_config=q_config,
+        input_feat=input_feat,
+    )
+    apply_clip(layer, clip_list)
+    # append prefix to make names global
+    awq_results["clip"] += append_str_prefix(
+        clip_list, get_op_name(model, layer) + "."
+    )
+    layer = layer.cpu()
+    del input_feat
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    dict_str = '\n'.join(f'{k}: {v}' for k, v in awq_results.items())
+    with open('awq_results_dict.txt', 'w') as f:
+        f.write(dict_str)
+    torch.cuda.empty_cache()
+    return awq_results
+
+def main():
+    config = Config()
+    config.n_vocab = 46152
+    model = Model(config)#调用transformer的编码器
+    stat_dict = torch.load('/root/gau/Gau_transformer/models_save/gau_best.pt')
+    model.load_state_dict({k.replace('net.',''):v for k,v in stat_dict.items()})
+    model.eval()
+    model.cuda()
+    layers = get_blocks(model)
+    samples = get_calib_dataset(
+        n_samples=16, block_size=16
+    )
+    samples = samples.cuda()
+    layers[0] = layers[0].cuda()
+
+    inps = []
+    # get input and kwargs to layer 0
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, weight_scale = None, **kwargs):
+            inps.append(inp)
+            raise ValueError  # early exit to break later inference
+
+    # patch layer 0 to catch input and kwargs
+    layers[0] = Catcher(layers[0])
+    try:
+        model(samples)
+    except ValueError:  # work with early exit
+        pass
+    del samples
+    layers[0] = layers[0].module  # restore
+    inps = inps[0]
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    awq_results_0 = get_scale_and_clip(model,layers,inps,0)
+
+
+
+    awq_results_1 = get_scale_and_clip(model,layers,inps,1)
+    awq_results_2 = get_scale_and_clip(model,layers,inps,2)
+    awq_results_3 = get_scale_and_clip(model,layers,inps,3)
+
+    torch.save(awq_results_0, '/root/gau/Gau_transformer/models_save/awq_results_0.pt')
+    torch.save(awq_results_1, '/root/gau/Gau_transformer/models_save/awq_results_1.pt')
+    torch.save(awq_results_2, '/root/gau/Gau_transformer/models_save/awq_results_2.pt')
+    torch.save(awq_results_3, '/root/gau/Gau_transformer/models_save/awq_results_3.pt')
+
+    #scale_list,clip_list = get_scale_and_clip(model)
+
+if __name__ == "__main__":
+    main()

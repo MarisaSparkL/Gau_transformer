@@ -208,13 +208,6 @@ class GAU(nn.Module):
 
         qk = self.to_qk(normed_x) #qk [500,128]
         q, k = self.offsetscale(qk) #q, k [500,128]
-        print("qk")
-        print(qk.shape)
-        print("q")
-        print(q.shape)
-        print("k")
-        print(k.shape)
-        return
 
         q, k = map(self.rotary_pos_emb.rotate_queries_or_keys, (q, k)) 
 
@@ -446,7 +439,9 @@ val_acc = 0.0
 val_loss = 0.0
 
 model.eval() # set the model to evaluation mode
-print(model)
+
+end_point = 50
+
 with torch.no_grad():
     for i, batch in enumerate(tqdm(test_data)):
         features, labels = batch
@@ -454,13 +449,22 @@ with torch.no_grad():
         
         labels = labels.cuda()
         outputs = model(features)
+        print('outputs')
+        print(outputs)
+        print('labels')
+        print(labels)
 
         loss = criterion(outputs, labels) 
         
         _, val_pred = torch.max(outputs, 1) 
         val_acc += (val_pred.cpu() == labels.cpu()).sum().item() # get the index of the class with the highest probability
         val_loss += loss.item()
-print(f'Val Acc: {val_acc/25000:3.5f} loss: {val_loss/len(test_data):3.5f}')
+        print(i)
+        print(val_acc)
+        print(val_loss)
+        if i == end_point:
+            break
+print(f'Val Acc: {val_acc/1000:3.5f} loss: {val_loss/len(test_data):3.5f}')
 
 
         
